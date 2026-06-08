@@ -450,6 +450,10 @@ pub struct LinFlexD<'a> {
     tx_state: Cell<TxState>,
     rx_state: Cell<RxState>,
     deferred_call: DeferredCall,
+    /// LIN_BAUD_CLK input frequency in Hz used to compute IBR/FBR.
+    /// Defaults to FIRC (48 MHz) — caller must update via
+    /// [`set_input_clock_hz`] after switching MC_CGM_0 mux 8.
+    input_clock_hz: Cell<u32>,
 }
 
 impl LinFlexD<'_> {
@@ -473,6 +477,7 @@ impl LinFlexD<'_> {
             tx_state: Cell::new(TxState::Idle),
             rx_state: Cell::new(RxState::Idle),
             deferred_call: DeferredCall::new(),
+            input_clock_hz: Cell::new(48_000_000),
         }
     }
 
@@ -484,6 +489,14 @@ impl LinFlexD<'_> {
     /// Create the LF1 instance.
     pub fn new_lf1() -> Self {
         Self::new(LF1_BASE)
+    }
+
+    /// Update the LIN_BAUD_CLK input frequency used to compute UART baud
+    /// divisors. Call **before** [`Configure::configure`] when the underlying
+    /// MC_CGM_0 mux 8 source has been switched away from FIRC (the
+    /// power-on default this driver assumes).
+    pub fn set_input_clock_hz(&self, hz: u32) {
+        self.input_clock_hz.set(hz);
     }
 
     // ---------------------------------------------------------------------------
@@ -498,19 +511,6 @@ impl LinFlexD<'_> {
         let regs = self.registers;
         for _ in 0..HW_POLL_MAX {
             if regs.linsr.read(LINSR::LINS) == LINSR::LINS::Value::INIT as u32 {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// Wait for UARTSR[DTFTFF] (TX complete / TX FIFO not full) to be set.
-    /// This is only used for the sync transmition, in panic situations or for early bring up debug
-    #[inline]
-    fn wait_for_tx_done(&self) -> bool {
-        let regs = self.registers;
-        for _ in 0..HW_POLL_MAX {
-            if regs.uartsr.is_set(UARTSR::DTFTFF) {
                 return true;
             }
         }
@@ -697,21 +697,7 @@ impl LinFlexD<'_> {
     /// Returns `true` on success, `false` if the byte was lost (poll budget
     /// exhausted or hardware not configured).
     pub fn putc(&self, byte: u8) -> bool {
-        let regs = self.registers;
-
-        // Acknowledge any stale DTF flag before writing.
-        regs.uartsr.write(UARTSR::DTFTFF::SET);
-
-        // Writing DATA0 triggers TX immediately.
-        regs.bdrl.write(BDRL::DATA0.val(byte as u32));
-
-        // Wait for the hardware to signal TX completion.
-        if self.wait_for_tx_done() {
-            regs.uartsr.write(UARTSR::DTFTFF::SET);
-            true
-        } else {
-            false
-        }
+        putc_poll(&self.registers, byte)
     }
 
     /// Transmit all bytes in `s`.
@@ -725,6 +711,32 @@ impl LinFlexD<'_> {
             self.putc(*b);
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Shared polling TX primitive
+// ---------------------------------------------------------------------------
+
+/// Transmit one byte over the given LINFlexD instance by polling UARTSR[DTFTFF].
+///
+/// Returns `true` on success, `false` if the poll budget expired (byte lost).
+/// Used by `LinFlexD::putc` for synchronous polling output.
+#[inline(never)]
+fn putc_poll(regs: &LinFlexDRegisters, byte: u8) -> bool {
+    // Acknowledge any stale DTF flag before writing.
+    regs.uartsr.write(UARTSR::DTFTFF::SET);
+
+    // Writing DATA0 triggers TX immediately.
+    regs.bdrl.write(BDRL::DATA0.val(byte as u32));
+
+    // Wait for the hardware to signal TX completion.
+    for _ in 0..HW_POLL_MAX {
+        if regs.uartsr.is_set(UARTSR::DTFTFF) {
+            regs.uartsr.write(UARTSR::DTFTFF::SET);
+            return true;
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -820,14 +832,22 @@ impl Configure for LinFlexD<'_> {
         //   baud = LIN_CLK / (16 × LDIV)
         //   LDIV = IBR + FBR/16
         //
-        // At 48 MHz FIRC:
-        //   115200: IBR=26, FBR=1  → 48_000_000/(16×26.0625) = 115 107 ≈ 115200
-        //   921600: IBR=3,  FBR=4  → 48_000_000/(16×3.25)    = 923 077 ≈ 921600
-        let (fbr, ibr): (u32, u32) = match params.baud_rate {
-            115200 => (1, 26),
-            921600 => (4, 3),
-            _ => return Err(ErrorCode::NOSUPPORT),
-        };
+        // Solve in 16ths to avoid floats:
+        //   ldiv16 = 16 × LDIV = round(clk_hz / baud)
+        //   IBR    = ldiv16 / 16   (truncate)
+        //   FBR    = ldiv16 % 16
+        // FBR is 4 bits (0..15); IBR is 20 bits (1..0xFFFFF).
+        let clk_hz = self.input_clock_hz.get();
+        let baud = params.baud_rate;
+        if baud == 0 || clk_hz == 0 {
+            return Err(ErrorCode::INVAL);
+        }
+        let ldiv16 = (clk_hz + baud / 2) / baud;
+        let ibr = ldiv16 / 16;
+        let fbr = ldiv16 % 16;
+        if ibr == 0 || ibr > 0xF_FFFF {
+            return Err(ErrorCode::NOSUPPORT);
+        }
 
         regs.linfbrr.write(LINFBRR::FBR.val(fbr));
         regs.linibrr.write(LINIBRR::IBR.val(ibr));
@@ -1002,4 +1022,74 @@ impl<'a> Receive<'a> for LinFlexD<'a> {
         self.deferred_call.set();
         Err(ErrorCode::BUSY)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Early-boot synchronous debug output
+// ---------------------------------------------------------------------------
+
+/// Synchronous early-boot trace output via LINFLEXD_0 (LF0).
+///
+/// `debug!()` is interrupt/deferred-call driven and only drains once the
+/// kernel main loop starts. Anything that hangs before `kernel_loop()` (PLL
+/// lock waits, MC_CGM mux switches, fault handlers, …) can otherwise look like
+/// a silent freeze.
+///
+/// Assumes LF0 is already configured. Writes bytes directly using polling TX —
+/// no interrupts, no deferred calls, no constructed `LinFlexD` instance.
+///
+/// Usage:
+///
+/// ```rust,ignore
+/// use nxp_s32g3::trace_sync;
+/// trace_sync!("[CLK] step={} val=0x{:08x}", step, val);
+/// ```
+pub mod early_debug {
+    use core::fmt::{self, Write};
+
+    use kernel::utilities::registers::interfaces::{Readable, Writeable};
+
+    use super::{BDRL, HW_POLL_MAX, LF0_BASE, UARTSR};
+
+    struct TraceWriter;
+
+    fn putc(byte: u8) {
+        let regs = &*LF0_BASE;
+
+        regs.uartsr.write(UARTSR::DTFTFF::SET);
+        regs.bdrl.write(BDRL::DATA0.val(byte as u32));
+
+        for _ in 0..HW_POLL_MAX {
+            if regs.uartsr.is_set(UARTSR::DTFTFF) {
+                regs.uartsr.write(UARTSR::DTFTFF::SET);
+                break;
+            }
+        }
+    }
+
+    impl Write for TraceWriter {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            for &byte in s.as_bytes().iter() {
+                putc(byte);
+            }
+            Ok(())
+        }
+    }
+
+    /// Format and write synchronously. Used by the `trace_sync!` macro.
+    #[doc(hidden)]
+    pub fn write_fmt(args: fmt::Arguments<'_>) {
+        let _ = TraceWriter.write_fmt(args);
+        putc(b'\r');
+        putc(b'\n');
+    }
+}
+
+/// Format-and-print synchronously over LF0, bypassing the deferred debug
+/// infrastructure. Intended for early-boot bring-up and fault handlers.
+#[macro_export]
+macro_rules! trace_sync {
+    ($($arg:tt)*) => {
+        $crate::linflexd::early_debug::write_fmt(format_args!($($arg)*))
+    };
 }

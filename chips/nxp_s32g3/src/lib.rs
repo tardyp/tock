@@ -5,6 +5,7 @@
 #![no_std]
 
 pub mod chip;
+pub mod clocks;
 pub mod linflexd;
 pub mod mc_me;
 pub mod mscm;
