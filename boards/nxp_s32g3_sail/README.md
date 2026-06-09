@@ -18,10 +18,9 @@ It is intentionally limited to the build milestone:
 Build with:
 
 ```bash
-cd boards/nxp_s32g3_sail && cargo build --release --target thumbv7em-none-eabihf
-objcopy -O binary target/thumbv7em-none-eabihf/release/tock target/thumbv7em-none-eabihf/release/tock.bin
+make -C boards/nxp_s32g3_sail
 ```
 
-You will need a bootloader or jtag controller to load the resulting `tock.bin` onto the SAIL platform, and jump in thumb mode to the entry point at `0x34000000`. 
+You will need a bootloader or jtag controller to load the resulting `nxp_s32g3_sail.bin` onto the s32g sram, and jump in thumb mode to the entry point at `0x34000000`. 
 The bootloader is outside the scope of this repository.
 Future release will include a target that can be flashed directly into NOR and booted by the HSE.
