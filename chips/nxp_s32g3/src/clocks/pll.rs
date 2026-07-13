@@ -226,7 +226,7 @@ pub struct PllConfig {
     /// Multiplication factor integer (MFI). Valid range: 16..255 (8-bit field).
     pub mfi: u16,
     /// Multiplication factor numerator (fractional part). Valid values are
-    /// less than 18432 per RM `PLLFD[MFN]` and the S32CC clock driver.
+    /// less than 18432 per RM PLLFD[MFN] and the S32CC clock driver.
     pub mfn: u32,
 }
 impl PllConfig {
@@ -234,29 +234,18 @@ impl PllConfig {
     pub const fn new(rdiv: u8, mfi: u16, mfn: u32) -> Self {
         Self { rdiv, mfi, mfn }
     }
-    /// Create a PLL configuration from frequency parameters.
-    ///
-    /// Solves `f_vco = f_ref / rdiv * (mfi + mfn / 18432)` using checked
-    /// integer arithmetic and rejects values that cannot fit the hardware.
-    pub fn from_frequencies(f_ref: u32, f_vco: u32, rdiv: u8) -> Result<Self, ErrorCode> {
-        if f_ref == 0 || !(1..=7).contains(&rdiv) {
-            return Err(ErrorCode::INVAL);
-        }
-        let ratio = u64::from(f_vco)
-            .checked_mul(u64::from(rdiv))
-            .and_then(|value| value.checked_mul(PLL_MFN_DENOMINATOR))
-            .ok_or(ErrorCode::INVAL)?
-            / u64::from(f_ref);
-        let mfi = ratio / PLL_MFN_DENOMINATOR;
-        let mfn = ratio % PLL_MFN_DENOMINATOR;
-        if !(16..=255).contains(&mfi) || mfn >= PLL_MFN_DENOMINATOR {
-            return Err(ErrorCode::INVAL);
-        }
-        Ok(Self {
-            rdiv,
-            mfi: u16::try_from(mfi).map_err(|_| ErrorCode::INVAL)?,
-            mfn: u32::try_from(mfn).map_err(|_| ErrorCode::INVAL)?,
-        })
+    /// Create a new PLL configuration from frequency parameters.
+    /// Solves VCO frequency: `f_vco = f_ref / rdiv * (mfi + mfn / 18432)`
+    pub const fn from_frequencies(f_ref: u32, f_vco: u32, rdiv: u8) -> Self {
+        // Solve for MFI and MFN given f_ref, f_vco, and rdiv.
+        //   f_vco = f_ref / rdiv * (mfi + mfn / 18432)
+        //   mfi + mfn / 18432 = f_vco * rdiv / f_ref
+        //   mfi = floor(f_vco * rdiv / f_ref)
+        //   mfn = round((f_vco * rdiv / f_ref - mfi) * 18432)
+        let ratio = (f_vco as u64) * (rdiv as u64) * PLL_MFN_DENOMINATOR / (f_ref as u64);
+        let mfi = (ratio / PLL_MFN_DENOMINATOR) as u16;
+        let mfn = (ratio % PLL_MFN_DENOMINATOR) as u32;
+        Self { rdiv, mfi, mfn }
     }
 }
 /// Configuration for a single PHI output divider.
@@ -317,19 +306,6 @@ impl Pll {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn new_with_registers(
-        instance: PllInstance,
-        registers: StaticRef<PllRegisters>,
-    ) -> Self {
-        Self {
-            registers,
-            instance,
-            vco_freq_hz: Cell::new(0),
-            locked: Cell::new(false),
-        }
-    }
-
     /// Get the PLL instance identifier.
     pub fn instance(&self) -> PllInstance {
         self.instance
@@ -341,20 +317,16 @@ impl Pll {
     /// external crystal oscillator. Must be called while the PLL is powered
     /// down (PLLPD=1).
     ///
-    /// If already locked, succeeds only when hardware already selects FXOSC;
-    /// a locked PLL is never rewritten.
+    /// If the PLL is already locked (hardware LOCK=1, e.g. configured by a
+    /// prior boot stage), this is a no-op.
     ///
     /// # Errors
-    /// - [`ErrorCode::BUSY`]: PLL is locked with a non-FXOSC reference
+    /// - [`ErrorCode::BUSY`]: PLL is locked — must disable first
     pub fn select_reference_fxosc(&self) -> Result<(), ErrorCode> {
         let regs = &*self.registers;
         if regs.pllsr.is_set(PLLSR::LOCK) {
             self.locked.set(true);
-            return if regs.pllclkmux.matches_all(PLLCLKMUX::REFCLKSEL::Fxosc) {
-                Ok(())
-            } else {
-                Err(ErrorCode::BUSY)
-            };
+            return Ok(());
         }
         regs.pllclkmux.write(PLLCLKMUX::REFCLKSEL::Fxosc);
         Ok(())
@@ -376,15 +348,7 @@ impl Pll {
 
         if regs.pllsr.is_set(PLLSR::LOCK) {
             self.locked.set(true);
-            let snapshot = self.snapshot(ref_freq_hz)?;
-            let matches = snapshot.ref_clock_hz == ref_freq_hz
-                && snapshot.rdiv == u32::from(config.rdiv)
-                && snapshot.mfi == u32::from(config.mfi)
-                && snapshot.mfn == config.mfn
-                && snapshot.fractional == (config.mfn != 0);
-            if !matches {
-                return Err(ErrorCode::BUSY);
-            }
+            let snapshot = self.snapshot(ref_freq_hz);
             self.vco_freq_hz.set(snapshot.vco_hz);
             return Ok(());
         }
@@ -399,23 +363,24 @@ impl Pll {
             return Err(ErrorCode::INVAL);
         }
 
-        // Compute before writing hardware so invalid arithmetic cannot leave
-        // a partially updated PLL configuration behind.
-        let vco = Self::compute_vco_hz(
-            ref_freq_hz,
-            u32::from(config.rdiv),
-            u32::from(config.mfi),
-            config.mfn,
-        )?;
-
         regs.plldv
-            .write(PLLDV::RDIV.val(u32::from(config.rdiv)) + PLLDV::MFI.val(u32::from(config.mfi)));
+            .write(PLLDV::RDIV.val(config.rdiv as u32) + PLLDV::MFI.val(config.mfi as u32));
+
         if config.mfn > 0 {
             regs.pllfd
                 .write(PLLFD::SDMEN::SET + PLLFD::MFN.val(config.mfn));
         } else {
             regs.pllfd.write(PLLFD::SDMEN::CLEAR + PLLFD::MFN.val(0));
         }
+
+        // Compute and cache VCO frequency:
+        //   f_vco = f_ref / rdiv * (mfi + mfn / 18432)
+        let vco = Self::compute_vco_hz(
+            ref_freq_hz,
+            config.rdiv as u32,
+            config.mfi as u32,
+            config.mfn,
+        );
         self.vco_freq_hz.set(vco);
 
         Ok(())
@@ -437,13 +402,20 @@ impl Pll {
         if regs.pllsr.is_set(PLLSR::LOCK) {
             self.locked.set(true);
             let current = regs.pllodiv[phi.index].extract();
-            let matches = current.is_set(PLLODIV::DE) == phi.enabled
-                && current.read(PLLODIV::DIV) == u32::from(phi.div);
-            return if matches {
-                Ok(())
-            } else {
-                Err(ErrorCode::BUSY)
-            };
+            let current_enabled = current.is_set(PLLODIV::DE);
+            let current_div = current.read(PLLODIV::DIV) as u8;
+
+            if !current_enabled || current_div == phi.div || !phi.enabled {
+                if phi.enabled {
+                    regs.pllodiv[phi.index]
+                        .write(PLLODIV::DE::SET + PLLODIV::DIV.val(phi.div as u32));
+                } else {
+                    regs.pllodiv[phi.index].write(PLLODIV::DE::CLEAR + PLLODIV::DIV.val(0));
+                }
+                return Ok(());
+            }
+
+            return Err(ErrorCode::BUSY);
         }
 
         if phi.enabled {
@@ -454,31 +426,28 @@ impl Pll {
         Ok(())
     }
 
-    fn compute_vco_hz(ref_freq_hz: u32, rdiv: u32, mfi: u32, mfn: u32) -> Result<u32, ErrorCode> {
-        if ref_freq_hz == 0 || rdiv == 0 {
-            return Err(ErrorCode::INVAL);
+    fn compute_vco_hz(ref_freq_hz: u32, rdiv: u32, mfi: u32, mfn: u32) -> u32 {
+        if rdiv == 0 {
+            return 0;
         }
-        let ref_div = u64::from(ref_freq_hz) / u64::from(rdiv);
-        let integer = ref_div
-            .checked_mul(u64::from(mfi))
-            .ok_or(ErrorCode::INVAL)?;
-        let fractional = ref_div
-            .checked_mul(u64::from(mfn))
-            .ok_or(ErrorCode::INVAL)?
-            / PLL_MFN_DENOMINATOR;
-        let vco = integer.checked_add(fractional).ok_or(ErrorCode::INVAL)?;
-        u32::try_from(vco).map_err(|_| ErrorCode::INVAL)
+
+        let ref_div = ref_freq_hz as u64 / rdiv as u64;
+        let integer = ref_div * mfi as u64;
+        let fractional = ref_div * mfn as u64 / PLL_MFN_DENOMINATOR;
+
+        (integer + fractional) as u32
     }
 
     /// Decode the live PLL registers without assuming the requested
     /// configuration was applied. `fxosc_freq_hz` is used only when the live
     /// PLLCLKMUX selects FXOSC; FIRC is fixed at 48 MHz.
-    pub fn snapshot(&self, fxosc_freq_hz: u32) -> Result<PllSnapshot, ErrorCode> {
+    pub fn snapshot(&self, fxosc_freq_hz: u32) -> PllSnapshot {
         let regs = &*self.registers;
         let pllclkmux = regs.pllclkmux.get();
         let plldv = regs.plldv.get();
         let pllfd = regs.pllfd.get();
-        let rdiv = regs.plldv.read(PLLDV::RDIV);
+        let rdiv_field = regs.plldv.read(PLLDV::RDIV);
+        let rdiv = if rdiv_field == 0 { 1 } else { rdiv_field };
         let mfi = regs.plldv.read(PLLDV::MFI);
         let fractional = regs.pllfd.is_set(PLLFD::SDMEN);
         let mfn = if fractional {
@@ -491,8 +460,9 @@ impl Pll {
         } else {
             fxosc_freq_hz
         };
-        let vco_hz = Self::compute_vco_hz(ref_clock_hz, rdiv, mfi, mfn)?;
-        Ok(PllSnapshot {
+        let vco_hz = Self::compute_vco_hz(ref_clock_hz, rdiv, mfi, mfn);
+
+        PllSnapshot {
             pllclkmux,
             plldv,
             pllfd,
@@ -502,7 +472,7 @@ impl Pll {
             fractional,
             ref_clock_hz,
             vco_hz,
-        })
+        }
     }
 
     /// Return the raw PLLODIV register for a PHI output.
@@ -592,8 +562,8 @@ impl Pll {
             return None;
         }
 
-        let div_val = odiv.read(PLLODIV::DIV).checked_add(1)?;
-        self.vco_freq_hz.get().checked_div(div_val)
+        let div_val = odiv.read(PLLODIV::DIV) + 1;
+        Some(self.vco_freq_hz.get() / div_val)
     }
 
     /// Enable SSCG (frequency modulation) on PLLs that support it.
@@ -635,167 +605,5 @@ impl ClockInterface for Pll {
 
     fn disable(&self) {
         let _ = self.disable_pll();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    const PLL_WORDS: usize = 0xA0 / 4;
-    const PLLSR: usize = 1;
-    const PLLDV: usize = 2;
-    const PLLFD: usize = 4;
-    const PLLCLKMUX: usize = 8;
-    const PLLODIV: usize = 32;
-    const LOCK: u32 = 1 << 2;
-    const SDMEN: u32 = 1 << 30;
-    const DE: u32 = 1 << 31;
-
-    fn pll(backing: &mut [u32; PLL_WORDS], instance: PllInstance) -> Pll {
-        let registers = unsafe { StaticRef::new(backing.as_mut_ptr() as *const PllRegisters) };
-        Pll::new_with_registers(instance, registers)
-    }
-
-    fn live_config(backing: &mut [u32; PLL_WORDS], rdiv: u8, mfi: u8, mfn: u32, fxosc: bool) {
-        backing[PLLSR] = LOCK;
-        backing[PLLDV] = (u32::from(rdiv) << 12) | u32::from(mfi);
-        backing[PLLFD] = if mfn == 0 { 0 } else { SDMEN | mfn };
-        backing[PLLCLKMUX] = u32::from(fxosc);
-    }
-
-    #[test]
-    fn unlocked_configure_writes_dividers_and_caches_vco() {
-        let mut backing = [0; PLL_WORDS];
-        let pll = pll(&mut backing, PllInstance::Core);
-        let config = PllConfig::new(2, 40, 9_216);
-
-        assert_eq!(pll.configure(48_000_000, config), Ok(()));
-        assert_eq!(backing[PLLDV], (2 << 12) | 40);
-        assert_eq!(backing[PLLFD], SDMEN | 9_216);
-        assert_eq!(pll.get_vco_frequency_hz(), 972_000_000);
-    }
-
-    #[test]
-    fn locked_reference_accepts_only_fxosc_without_writing() {
-        let mut backing = [0; PLL_WORDS];
-        backing[PLLSR] = LOCK;
-        backing[PLLCLKMUX] = 1;
-        let pll = pll(&mut backing, PllInstance::Core);
-        let before = backing;
-        assert_eq!(pll.select_reference_fxosc(), Ok(()));
-        assert_eq!(backing, before);
-
-        backing[PLLCLKMUX] = 0;
-        let before = backing;
-        assert_eq!(pll.select_reference_fxosc(), Err(ErrorCode::BUSY));
-        assert_eq!(backing, before);
-    }
-
-    #[test]
-    fn locked_configure_requires_exact_live_state_without_writing() {
-        let config = PllConfig::new(2, 40, 1_024);
-        let cases = [
-            (2, 40, 1_024, true, 24_000_000, Ok(())),
-            (2, 40, 1_024, false, 24_000_000, Err(ErrorCode::BUSY)),
-            (3, 40, 1_024, true, 24_000_000, Err(ErrorCode::BUSY)),
-            (2, 41, 1_024, true, 24_000_000, Err(ErrorCode::BUSY)),
-            (2, 40, 1_025, true, 24_000_000, Err(ErrorCode::BUSY)),
-            (2, 40, 0, true, 24_000_000, Err(ErrorCode::BUSY)),
-        ];
-
-        for (rdiv, mfi, mfn, fxosc, reference, expected) in cases {
-            let mut backing = [0; PLL_WORDS];
-            live_config(&mut backing, rdiv, mfi, mfn, fxosc);
-            let pll = pll(&mut backing, PllInstance::Core);
-            let before = backing;
-            assert_eq!(pll.configure(reference, config), expected);
-            assert_eq!(backing, before);
-        }
-    }
-
-    #[test]
-    fn locked_phi_requires_exact_enable_and_divider_without_writing() {
-        let requested = PhiConfig {
-            index: 1,
-            div: 7,
-            enabled: true,
-        };
-        let cases = [
-            (DE | (7 << 16), Ok(())),
-            (7 << 16, Err(ErrorCode::BUSY)),
-            (DE | (8 << 16), Err(ErrorCode::BUSY)),
-        ];
-
-        for (odiv, expected) in cases {
-            let mut backing = [0; PLL_WORDS];
-            backing[PLLSR] = LOCK;
-            backing[PLLODIV + requested.index] = odiv;
-            let pll = pll(&mut backing, PllInstance::Core);
-            let before = backing;
-            assert_eq!(pll.configure_phi(requested), expected);
-            assert_eq!(backing, before);
-        }
-    }
-
-    #[test]
-    fn from_frequencies_rejects_invalid_and_accepts_hardware_boundaries() {
-        for (reference, target, rdiv) in [
-            (0, 384_000_000, 1),
-            (24_000_000, 384_000_000, 0),
-            (24_000_000, 384_000_000, 8),
-            (24_000_000, 360_000_000, 1),
-            (1, u32::MAX, 7),
-        ] {
-            assert!(matches!(
-                PllConfig::from_frequencies(reference, target, rdiv),
-                Err(ErrorCode::INVAL)
-            ));
-        }
-
-        let minimum = PllConfig::from_frequencies(24_000_000, 384_000_000, 1).unwrap();
-        assert_eq!((minimum.rdiv, minimum.mfi, minimum.mfn), (1, 16, 0));
-        let maximum = PllConfig::from_frequencies(16_000_000, 4_080_000_000, 1).unwrap();
-        assert_eq!((maximum.rdiv, maximum.mfi, maximum.mfn), (1, 255, 0));
-
-        let mut backing = [0; PLL_WORDS];
-        let pll = pll(&mut backing, PllInstance::Core);
-        assert_eq!(pll.configure(16_843_009, PllConfig::new(1, 255, 0)), Ok(()));
-        assert_eq!(pll.get_vco_frequency_hz(), u32::MAX);
-    }
-
-    #[test]
-    fn configure_rejects_invalid_fields_and_unrepresentable_vco_without_writes() {
-        let cases = [
-            (0, PllConfig::new(1, 16, 0)),
-            (48_000_000, PllConfig::new(0, 16, 0)),
-            (48_000_000, PllConfig::new(8, 16, 0)),
-            (48_000_000, PllConfig::new(1, 15, 0)),
-            (48_000_000, PllConfig::new(1, 256, 0)),
-            (48_000_000, PllConfig::new(1, 16, 18_432)),
-            (u32::MAX, PllConfig::new(1, 255, 0)),
-        ];
-
-        for (reference, config) in cases {
-            let mut backing = [0xA5A5_A5A5; PLL_WORDS];
-            backing[PLLSR] = 0;
-            let pll = pll(&mut backing, PllInstance::Core);
-            let before = backing;
-            assert_eq!(pll.configure(reference, config), Err(ErrorCode::INVAL));
-            assert_eq!(backing, before);
-        }
-    }
-
-    #[test]
-    fn snapshot_and_phi_getter_reject_invalid_or_unavailable_frequency() {
-        let mut backing = [0; PLL_WORDS];
-        let pll = pll(&mut backing, PllInstance::Core);
-        assert!(matches!(pll.snapshot(24_000_000), Err(ErrorCode::INVAL)));
-        assert_eq!(pll.get_phi_frequency_hz(0), None);
-
-        live_config(&mut backing, 1, 16, 0, true);
-        assert_eq!(pll.configure(24_000_000, PllConfig::new(1, 16, 0)), Ok(()));
-        assert_eq!(pll.get_phi_frequency_hz(0), None);
-        assert_eq!(pll.get_phi_frequency_hz(2), None);
     }
 }

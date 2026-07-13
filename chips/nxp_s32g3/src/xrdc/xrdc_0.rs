@@ -37,7 +37,7 @@ use super::{
     invalidate_mda, invalidate_mrgd, invalidate_pdac_window, max_mrc_idx, nmrgd_for_mrc,
     pdac_register_for_slot, program_mda_bus, program_mda_core, program_mrgd, program_pdac,
     register_barrier, search_and_patch_mrgd, Access, BusInitiator, Domain, MdaRaw, MrcRange,
-    MrgdPatchOutcome, MrgdRaw, MrgdTarget, PdacRaw, PrivAttr, SecureAttr, XrdcPatchError,
+    MrgdPatchError, MrgdPatchOutcome, MrgdRaw, MrgdTarget, PdacRaw, PrivAttr, SecureAttr,
     XrdcRegisters, CR,
 };
 
@@ -655,28 +655,33 @@ impl Xrdc0 {
     ///    with matching address range; if found, ORs in ACP bits. Otherwise
     ///    allocates in the first unused slot.
     /// 7. Does **not** set per-entry LK1/LK2.
-    pub fn patch(&self, cfg: &Config<'_>) -> Result<(), XrdcPatchError> {
+    pub fn patch(&self, cfg: &Config<'_>) {
         let regs: &XrdcRegisters = &self.registers;
 
+        // 1. Refuse to silently NOP on a locked instance.
         if regs.cr.is_set(CR::LK1) {
-            return Err(XrdcPatchError::LockedDescriptor);
+            panic!("xrdc_0::Xrdc0::patch: CR[LK1] is already set — reflash to reconfigure XRDC_0");
         }
 
+        // 4a. Patch MDA entries.
         for entry in cfg.masters {
             let raw = entry.0;
-            super::patch_mda(&regs.mda[raw.master_idx as usize], raw)?;
+            let slot = &regs.mda[raw.master_idx as usize];
+            super::patch_mda(slot, raw);
         }
 
+        // 4b. Patch PDAC entries.
         for entry in cfg.peripherals {
             let raw = entry.0;
-            super::patch_pdac(super::pdac_register_for_slot(regs, raw.slot), raw)?;
+            let pdac = super::pdac_register_for_slot(regs, raw.slot);
+            super::patch_pdac(pdac, raw);
         }
 
+        // 4c. Patch MRGD entries.
         for entry in cfg.regions {
             let raw = entry.0;
-            super::patch_mrgd(&regs.mrgd, raw, nmrgd_for_mrc(raw.mrc, MRC_RANGES) as usize)?;
+            super::patch_mrgd(&regs.mrgd, raw);
         }
-        Ok(())
     }
 
     /// Lock the XRDC control register (`CR[LK1]`). After this call no
@@ -700,12 +705,13 @@ impl Xrdc0 {
     /// bounds that Tock cannot know at compile time.  For fully static policy,
     /// prefer the declarative [`Config`] + [`Xrdc0::apply`] / [`Xrdc0::patch`] path.
     ///
-    /// Never touches lock bits (`LK1`/`LK2`) on the descriptor.
+    /// Never touches lock bits (`LK1`/`LK2`) on the descriptor.  If the
+    /// descriptor is already locked, returns [`MrgdPatchError::DescriptorLocked`].
     pub fn search_and_patch_mrgd(
         &self,
         target: MrgdTarget,
         entry: &Mrgd,
-    ) -> Result<MrgdPatchOutcome, XrdcPatchError> {
+    ) -> Result<MrgdPatchOutcome, MrgdPatchError> {
         let raw = entry.0;
         let nmrgd = nmrgd_for_mrc(raw.mrc, MRC_RANGES) as usize;
         search_and_patch_mrgd(&self.registers.mrgd, raw, target, nmrgd)

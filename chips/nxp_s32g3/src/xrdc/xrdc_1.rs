@@ -65,11 +65,11 @@ use kernel::utilities::registers::interfaces::{ReadWriteable, Readable};
 use kernel::utilities::StaticRef;
 
 use super::{
-    allocate_unmapped_exact_mrgd, invalidate_mda, invalidate_mrgd, invalidate_pdac_window,
-    max_mrc_idx, nmrgd_for_mrc, pdac_register_for_slot, program_mda_bus, program_mda_core,
-    program_mrgd, program_pdac, register_barrier, search_and_patch_mrgd, Access, BusInitiator,
-    Domain, MdaRaw, MrcRange, MrgdPatchOutcome, MrgdRaw, MrgdTarget, PdacRaw, PrivAttr, SecureAttr,
-    XrdcPatchError, XrdcRegisters, CR,
+    invalidate_mda, invalidate_mrgd, invalidate_pdac_window, max_mrc_idx, nmrgd_for_mrc,
+    pdac_register_for_slot, program_mda_bus, program_mda_core, program_mrgd, program_pdac,
+    register_barrier, search_and_patch_mrgd, Access, BusInitiator, Domain, MdaRaw, MrcRange,
+    MrgdPatchError, MrgdPatchOutcome, MrgdRaw, MrgdTarget, PdacRaw, PrivAttr, SecureAttr,
+    XrdcRegisters, CR,
 };
 
 /// Base address of XRDC_1 (RM §15.7.4.1).
@@ -448,7 +448,7 @@ impl Xrdc1 {
     /// Program XRDC_1 from `cfg` and lock it for the duration of this power
     /// cycle. Behaviour mirrors [`super::xrdc_0::Xrdc0::apply`] but bounds
     /// every register-block iteration to XRDC_1's documented MDAC/MRC/PAC
-    /// counts (MDA_INSTANCE_COUNT, MRC_COUNT × MRGD_PER_MRC,
+    /// counts ([`MDA_INSTANCE_COUNT`], [`MRC_COUNT`] × [`MRGD_PER_MRC`],
     /// `XrdcRegisters::pdac_0_31` only — RM §15.3.4 Table 36: XRDC_1 has
     /// just one PAC group) so writes never spill into reserved register
     /// space.
@@ -520,32 +520,32 @@ impl Xrdc1 {
     }
     /// Additive patch for XRDC_1. Mirrors [`super::xrdc_0::Xrdc0::patch`]
     /// but bounds register access to XRDC_1's documented MDAC/MRC/PAC counts.
-    pub fn patch(&self, cfg: &Config<'_>) -> Result<(), XrdcPatchError> {
+    pub fn patch(&self, cfg: &Config<'_>) {
         let regs: &XrdcRegisters = &self.registers;
 
         if regs.cr.is_set(CR::LK1) {
-            return Err(XrdcPatchError::LockedDescriptor);
+            panic!("xrdc_1::Xrdc1::patch: CR[LK1] is already set — reflash to reconfigure XRDC_1");
         }
 
+        // Patch MDA entries.
         for entry in cfg.masters {
             let raw = entry.0;
-            super::patch_mda(&regs.mda[raw.master_idx as usize], raw)?;
+            let slot = &regs.mda[raw.master_idx as usize];
+            super::patch_mda(slot, raw);
         }
 
+        // Patch PDAC entries.
         for entry in cfg.peripherals {
             let raw = entry.0;
-            super::patch_pdac(super::pdac_register_for_slot(regs, raw.slot), raw)?;
+            let pdac = super::pdac_register_for_slot(regs, raw.slot);
+            super::patch_pdac(pdac, raw);
         }
 
+        // Patch MRGD entries.
         for entry in cfg.regions {
             let raw = entry.0;
-            super::patch_mrgd(
-                &regs.mrgd[..MRC_COUNT * MRGD_PER_MRC],
-                raw,
-                nmrgd_for_mrc(raw.mrc, MRC_RANGES) as usize,
-            )?;
+            super::patch_mrgd(&regs.mrgd[..MRC_COUNT * MRGD_PER_MRC], raw);
         }
-        Ok(())
     }
 
     /// Lock the XRDC_1 control register (`CR[LK1]`). Idempotent.
@@ -566,29 +566,17 @@ impl Xrdc1 {
     /// bounds that Tock cannot know at compile time.  For fully static policy,
     /// prefer the declarative [`Config`] + [`Xrdc1::apply`] / [`Xrdc1::patch`] path.
     ///
-    /// Never touches lock bits (`LK1`/`LK2`) on the descriptor.
+    /// Never touches lock bits (`LK1`/`LK2`) on the descriptor.  If the
+    /// descriptor is already locked, returns [`MrgdPatchError::DescriptorLocked`].
     pub fn search_and_patch_mrgd(
         &self,
         target: MrgdTarget,
         entry: &Mrgd,
-    ) -> Result<MrgdPatchOutcome, XrdcPatchError> {
+    ) -> Result<MrgdPatchOutcome, MrgdPatchError> {
         let raw = entry.0;
         let mrgd_slice = &self.registers.mrgd[..MRC_COUNT * MRGD_PER_MRC];
         let nmrgd = nmrgd_for_mrc(raw.mrc, MRC_RANGES) as usize;
         search_and_patch_mrgd(mrgd_slice, raw, target, nmrgd)
-    }
-
-    /// Allocate a static descriptor only after proving that no valid MRC
-    /// descriptor overlaps it. Intended solely for cold boot recovery when a
-    /// predecessor policy does not own the requested range.
-    pub fn allocate_unmapped_exact_mrgd(
-        &self,
-        entry: &Mrgd,
-    ) -> Result<MrgdPatchOutcome, XrdcPatchError> {
-        let raw = entry.0;
-        let mrgd_slice = &self.registers.mrgd[..MRC_COUNT * MRGD_PER_MRC];
-        let nmrgd = nmrgd_for_mrc(raw.mrc, MRC_RANGES) as usize;
-        allocate_unmapped_exact_mrgd(mrgd_slice, raw, nmrgd)
     }
 }
 

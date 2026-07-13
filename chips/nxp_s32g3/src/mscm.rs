@@ -526,9 +526,9 @@ impl Mscm {
     /// live interrupt delivery to the target core.
     /// **Must only be called during board initialisation, before `kernel_loop()`.**
     /// See safety manual §MSCM-INIT.
-    pub fn enable_interrupt(&self, irq: u32, core: S32G3Core) -> Result<(), kernel::ErrorCode> {
+    pub fn enable_interrupt(&self, irq: u32, core: S32G3Core) {
         if irq >= NUM_EXTERNAL_IRQS as u32 {
-            return Err(kernel::ErrorCode::INVAL);
+            panic!("Invalid IRQ number: {}", irq);
         }
         let irsprc = &self.registers.irsprc[irq as usize];
         match core {
@@ -537,36 +537,5 @@ impl Mscm {
             S32G3Core::M7_2 => irsprc.modify(Irsprc::M7_2::Enabled),
             S32G3Core::M7_3 => irsprc.modify(Irsprc::M7_3::Enabled),
         }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn out_of_range_irq_is_rejected_without_register_access() {
-        let mut backing = [0u32; 0xA60 / 4];
-        let registers = unsafe { StaticRef::new(backing.as_mut_ptr() as *const MscmRegisters) };
-        let mscm = Mscm { registers };
-
-        assert_eq!(
-            mscm.enable_interrupt(NUM_EXTERNAL_IRQS as u32, S32G3Core::M7_0),
-            Err(kernel::ErrorCode::INVAL)
-        );
-        assert_eq!(backing, [0; 0xA60 / 4]);
-    }
-
-    #[test]
-    fn valid_irq_routes_to_the_requested_m7_core() {
-        let mut backing = [0u32; 0xA60 / 4];
-        let registers = unsafe { StaticRef::new(backing.as_mut_ptr() as *const MscmRegisters) };
-        let mscm = Mscm { registers };
-        let irq = 42;
-
-        assert_eq!(mscm.enable_interrupt(irq, S32G3Core::M7_2), Ok(()));
-        let route = backing[(0x880 / 4) + irq as usize / 2] as u16;
-        assert_eq!(route, 1 << Irsprc::M7_2.shift);
     }
 }

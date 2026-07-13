@@ -242,7 +242,7 @@ impl Dfs {
 
     /// Reconfigure a DFS port **even if it is already locked**.
     ///
-    /// Unlike [`Self::configure_port`], this does not skip a locked port. It resets
+    /// Unlike [`configure_port`], this does not skip a locked port. It resets
     /// the individual port (PORTRESET), rewrites the divider, releases the
     /// port, and waits for re-lock.
     ///
@@ -320,15 +320,15 @@ impl Dfs {
             return None;
         }
 
-        // f_port = f_vco × 18 / (mfi × 36 + mfn).
-        let divisor = mfi.checked_mul(36)?.checked_add(mfn)?;
+        // f_port = f_vco / (2 × (mfi + mfn/36))
+        // = f_vco × 36 / (2 × (mfi × 36 + mfn))
+        // = f_vco × 18 / (mfi × 36 + mfn)
+        let divisor = mfi * 36 + mfn;
         if divisor == 0 {
             return None;
         }
-        let freq = u64::from(vco)
-            .checked_mul(18)?
-            .checked_div(u64::from(divisor))?;
-        u32::try_from(freq).ok()
+        let freq = (vco as u64) * 18 / (divisor as u64);
+        Some(freq as u32)
     }
 }
 

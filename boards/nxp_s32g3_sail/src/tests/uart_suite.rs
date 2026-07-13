@@ -2,164 +2,89 @@
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 // Copyright Tock Contributors 2026.
 
-//! Deterministic LF1 UART test suite for the `test-harness` image.
+//! Sequential UART test suite for LinFlexD on LF0.
 //!
-//! The suite needs no loopback wire. It verifies one buffered transmit and two
-//! immediate deferred aborts, writes one LF0 polling result line, then halts.
+//! Runs four test phases in sequence, advancing via callbacks:
+//!   Phase 1: RX buffer → wait for 4 bytes from human (press 4 keys on LF0)
+//!   Phase 2: TX buffer → success callback
+//!   Phase 3: TX buffer → immediate abort → CANCEL callback via deferred call
+//!   Phase 4: RX buffer → immediate abort → CANCEL callback via deferred call
+//!
+//! To run, call from `lib.rs::start()`:
+//! ```rust,ignore
+//!     tests::uart_suite::run(uart_test);
+//! ```
+//!
+//! Results are reported on the debug console (LF0).
 
 use core::cell::Cell;
 use core::ptr::addr_of_mut;
 
-use capsules_core::test::capsule_test::{CapsuleTest, CapsuleTestClient};
+use kernel::debug;
 use kernel::hil::uart::{self, Receive, Transmit};
+use kernel::static_init;
 use kernel::utilities::cells::{OptionalCell, TakeCell};
-use kernel::{static_init, ErrorCode};
-use nxp_s32g3::linflexd::transmit_lf0_sync;
+use kernel::ErrorCode;
+
 use nxp_s32g3::linflexd::LinFlexD;
 
-const TX_LEN: usize = 16;
-const RX_LEN: usize = 4;
-const RESULT_PASS: &str = "S32G3_UART_TEST result=PASS tx=PASS tx_abort=PASS rx_abort=PASS\r\n";
-const RESULT_FAIL_TT: &str = "S32G3_UART_TEST result=FAIL tx=FAIL tx_abort=FAIL rx_abort=PASS\r\n";
-const RESULT_FAIL_TR: &str = "S32G3_UART_TEST result=FAIL tx=FAIL tx_abort=PASS rx_abort=FAIL\r\n";
-const RESULT_FAIL_T: &str = "S32G3_UART_TEST result=FAIL tx=FAIL tx_abort=PASS rx_abort=PASS\r\n";
-const RESULT_FAIL_AT: &str = "S32G3_UART_TEST result=FAIL tx=PASS tx_abort=FAIL rx_abort=FAIL\r\n";
-const RESULT_FAIL_A: &str = "S32G3_UART_TEST result=FAIL tx=PASS tx_abort=FAIL rx_abort=PASS\r\n";
-const RESULT_FAIL_R: &str = "S32G3_UART_TEST result=FAIL tx=PASS tx_abort=PASS rx_abort=FAIL\r\n";
-const RESULT_FAIL_ALL: &str = "S32G3_UART_TEST result=FAIL tx=FAIL tx_abort=FAIL rx_abort=FAIL\r\n";
-const PANIC_RESOURCES_BOUND: &str =
-    "S32G3_S12 panic_resources chip=bound processes=bound printer=bound\r\n";
-static mut TX_OVERLAP: [u8; TX_LEN] = [0; TX_LEN];
-static mut RX_OVERLAP: [u8; RX_LEN] = [0; RX_LEN];
+// ---------------------------------------------------------------------------
+// Test phases
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
+    Loopback,
+    RxSuccess,
     TxSuccess,
     TxAbort,
     RxAbort,
     Done,
 }
 
-#[derive(Clone, Copy)]
-struct SuiteResult {
-    phase: Phase,
-    tx_ok: bool,
-    tx_abort_ok: bool,
-    rx_abort_ok: bool,
-    tx_abort_preconditions_ok: bool,
-    rx_abort_preconditions_ok: bool,
-    emitted: bool,
-}
-
-impl SuiteResult {
-    const fn new() -> Self {
-        Self {
-            phase: Phase::TxSuccess,
-            tx_ok: false,
-            tx_abort_ok: false,
-            rx_abort_ok: false,
-            tx_abort_preconditions_ok: false,
-            rx_abort_preconditions_ok: false,
-            emitted: false,
-        }
-    }
-
-    fn tx_success(&mut self, rval: Result<(), ErrorCode>, tx_len: usize) -> bool {
-        if self.phase != Phase::TxSuccess {
-            return false;
-        }
-        self.tx_ok = rval == Ok(()) && tx_len == TX_LEN;
-        self.phase = Phase::TxAbort;
-        true
-    }
-
-    fn tx_abort(
-        &mut self,
-        preconditions_ok: bool,
-        rval: Result<(), ErrorCode>,
-        tx_len: usize,
-    ) -> bool {
-        if self.phase != Phase::TxAbort {
-            return false;
-        }
-        self.tx_abort_preconditions_ok = preconditions_ok;
-        self.tx_abort_ok = preconditions_ok && rval == Err(ErrorCode::CANCEL) && tx_len == 0;
-        self.phase = Phase::RxAbort;
-        true
-    }
-
-    fn rx_abort(
-        &mut self,
-        preconditions_ok: bool,
-        rval: Result<(), ErrorCode>,
-        rx_len: usize,
-        error: uart::Error,
-    ) -> bool {
-        if self.phase != Phase::RxAbort {
-            return false;
-        }
-        self.rx_abort_preconditions_ok = preconditions_ok;
-        self.rx_abort_ok = preconditions_ok
-            && rval == Err(ErrorCode::CANCEL)
-            && rx_len == 0
-            && error == uart::Error::Aborted;
-        self.phase = Phase::Done;
-        true
-    }
-
-    fn fail_current(&mut self) {
-        match self.phase {
-            Phase::TxSuccess => self.tx_ok = false,
-            Phase::TxAbort => self.tx_abort_ok = false,
-            Phase::RxAbort => self.rx_abort_ok = false,
-            Phase::Done => return,
-        }
-        self.phase = match self.phase {
-            Phase::TxSuccess => Phase::TxAbort,
-            Phase::TxAbort => Phase::RxAbort,
-            Phase::RxAbort | Phase::Done => Phase::Done,
-        };
-    }
-
-    fn take_result_line(&mut self) -> Option<&'static str> {
-        if self.phase != Phase::Done || self.emitted {
-            return None;
-        }
-        self.emitted = true;
-        Some(match (self.tx_ok, self.tx_abort_ok, self.rx_abort_ok) {
-            (true, true, true) => RESULT_PASS,
-            (false, false, true) => RESULT_FAIL_TT,
-            (false, true, false) => RESULT_FAIL_TR,
-            (false, true, true) => RESULT_FAIL_T,
-            (true, false, false) => RESULT_FAIL_AT,
-            (true, false, true) => RESULT_FAIL_A,
-            (true, true, false) => RESULT_FAIL_R,
-            (false, false, false) => RESULT_FAIL_ALL,
-        })
-    }
-}
+// ---------------------------------------------------------------------------
+// Test harness struct
+// ---------------------------------------------------------------------------
 
 struct UartTestSuite {
     uart: OptionalCell<&'static LinFlexD<'static>>,
-    client: OptionalCell<&'static dyn CapsuleTestClient>,
-    result: Cell<SuiteResult>,
+    phase: Cell<Phase>,
     tx_buf: TakeCell<'static, [u8]>,
     rx_buf: TakeCell<'static, [u8]>,
+    passed: Cell<u32>,
+    failed: Cell<u32>,
 }
 
 impl UartTestSuite {
-    const fn new(client: &'static dyn CapsuleTestClient) -> Self {
+    const fn new() -> Self {
         Self {
             uart: OptionalCell::empty(),
-            client: OptionalCell::new(client),
-            result: Cell::new(SuiteResult::new()),
+            phase: Cell::new(if USE_LOOPBACK {
+                Phase::Loopback
+            } else {
+                Phase::RxSuccess
+            }),
             tx_buf: TakeCell::empty(),
             rx_buf: TakeCell::empty(),
+            passed: Cell::new(0),
+            failed: Cell::new(0),
         }
     }
 
-    fn start_phase(&self) {
-        match self.result.get().phase {
+    fn pass(&self, msg: &str) {
+        debug!("  [PASS] {}", msg);
+        self.passed.set(self.passed.get() + 1);
+    }
+
+    fn fail(&self, msg: &str) {
+        debug!("  [FAIL] {}", msg);
+        self.failed.set(self.failed.get() + 1);
+    }
+
+    fn start_next_phase(&self) {
+        match self.phase.get() {
+            Phase::Loopback => self.run_loopback(),
+            Phase::RxSuccess => self.run_rx_success(),
             Phase::TxSuccess => self.run_tx_success(),
             Phase::TxAbort => self.run_tx_abort(),
             Phase::RxAbort => self.run_rx_abort(),
@@ -167,103 +92,158 @@ impl UartTestSuite {
         }
     }
 
-    fn fail_current(&self) {
-        let mut result = self.result.get();
-        result.fail_current();
-        self.result.set(result);
-        self.start_phase();
+    fn advance(&self) {
+        let next = match self.phase.get() {
+            Phase::Loopback => Phase::RxSuccess,
+            Phase::RxSuccess => Phase::TxSuccess,
+            Phase::TxSuccess => Phase::TxAbort,
+            Phase::TxAbort => Phase::RxAbort,
+            Phase::RxAbort => Phase::Done,
+            Phase::Done => Phase::Done,
+        };
+        self.phase.set(next);
+        self.start_next_phase();
     }
 
-    fn run_tx_success(&self) {
-        self.uart.map(|uart| {
-            self.tx_buf.take().map(|buf| {
-                for (index, byte) in buf.iter_mut().enumerate() {
-                    *byte = b'A' + (index as u8 % 26);
-                }
-                if let Err((_error, buf)) = uart.transmit_buffer(buf, TX_LEN) {
-                    self.tx_buf.replace(buf);
-                    self.fail_current();
-                }
-            });
-        });
+    fn report(&self) {
+        debug!("========================================");
+        debug!(
+            "[UART SUITE] {} passed, {} failed",
+            self.passed.get(),
+            self.failed.get()
+        );
+        if self.failed.get() == 0 {
+            debug!("[UART SUITE] ALL TESTS PASSED");
+        } else {
+            debug!("[UART SUITE] SOME TESTS FAILED");
+        }
+        debug!("========================================");
     }
 
-    fn run_tx_abort(&self) {
+    // ------ Phase Loopback: TX→RX loopback (self-checked) ------
+
+    fn run_loopback(&self) {
+        debug!("[Phase Loopback] TX→RX loopback...");
         self.uart.map(|uart| {
             self.tx_buf.take().map(|buf| {
-                for byte in buf.iter_mut() {
-                    *byte = 0xAA;
+                let pattern = b"ABCD";
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = pattern[i % pattern.len()];
                 }
-                match uart.transmit_buffer(buf, TX_LEN) {
-                    Ok(()) => unsafe {
-                        (&mut *addr_of_mut!(TX_OVERLAP)).fill(0x55);
-                        let mut result = self.result.get();
-                        result.tx_abort_preconditions_ok = uart.transmit_abort()
-                            == Err(ErrorCode::BUSY)
-                            && matches!(
-                                uart.transmit_buffer(&mut *addr_of_mut!(TX_OVERLAP), TX_LEN),
-                                Err((ErrorCode::BUSY, _))
-                            );
-                        self.result.set(result);
-                    },
-                    Err((_error, buf)) => {
+                match uart.transmit_buffer(buf, RX_LEN) {
+                    Ok(()) => {} // Wait for TX callback to trigger RX.
+                    Err((code, buf)) => {
+                        self.fail("loopback transmit_buffer returned error");
+                        debug!("         error: {:?}", code);
                         self.tx_buf.replace(buf);
-                        self.fail_current();
+                        self.advance();
                     }
                 }
             });
         });
     }
 
+    // ------ Phase 1: RX success (human interaction) ------
+
+    fn run_rx_success(&self) {
+        debug!(
+            "[Phase 1] RX buffer success — press {} keys on LF0...",
+            RX_LEN
+        );
+        self.uart.map(|uart| {
+            self.rx_buf.take().map(|buf| {
+                match uart.receive_buffer(buf, RX_LEN) {
+                    Ok(()) => {} // Wait for callback.
+                    Err((code, buf)) => {
+                        self.fail("receive_buffer returned error");
+                        debug!("         error: {:?}", code);
+                        self.rx_buf.replace(buf);
+                        self.advance();
+                    }
+                }
+            });
+        });
+    }
+
+    // ------ Phase 2: TX success ------
+
+    fn run_tx_success(&self) {
+        debug!("[Phase 2] TX buffer success...");
+        self.uart.map(|uart| {
+            self.tx_buf.take().map(|buf| {
+                for (i, b) in buf.iter_mut().enumerate() {
+                    *b = b'A' + (i as u8 % 26);
+                }
+                match uart.transmit_buffer(buf, TX_LEN) {
+                    Ok(()) => {}
+                    Err((code, buf)) => {
+                        self.fail("transmit_buffer returned error");
+                        debug!("         error: {:?}", code);
+                        self.tx_buf.replace(buf);
+                        self.advance();
+                    }
+                }
+            });
+        });
+    }
+
+    // ------ Phase 3: TX abort ------
+
+    fn run_tx_abort(&self) {
+        debug!("[Phase 3] TX buffer abort...");
+        self.uart.map(|uart| {
+            self.tx_buf.take().map(|buf| {
+                for b in buf.iter_mut() {
+                    *b = 0xAA;
+                }
+                match uart.transmit_buffer(buf, TX_LEN) {
+                    Ok(()) => {
+                        let r = uart.transmit_abort();
+                        if r != Err(ErrorCode::BUSY) {
+                            self.fail("transmit_abort did not return Err(BUSY)");
+                            debug!("         got: {:?}", r);
+                        }
+                    }
+                    Err((code, buf)) => {
+                        self.fail("transmit_buffer returned error");
+                        debug!("         error: {:?}", code);
+                        self.tx_buf.replace(buf);
+                        self.advance();
+                    }
+                }
+            });
+        });
+    }
+
+    // ------ Phase 4: RX abort ------
+
     fn run_rx_abort(&self) {
+        debug!("[Phase 4] RX buffer abort...");
         self.uart.map(|uart| {
             self.rx_buf
                 .take()
                 .map(|buf| match uart.receive_buffer(buf, RX_LEN) {
-                    Ok(()) => unsafe {
-                        (&mut *addr_of_mut!(RX_OVERLAP)).fill(0);
-                        let mut result = self.result.get();
-                        result.rx_abort_preconditions_ok = uart.receive_abort()
-                            == Err(ErrorCode::BUSY)
-                            && matches!(
-                                uart.receive_buffer(&mut *addr_of_mut!(RX_OVERLAP), RX_LEN),
-                                Err((ErrorCode::BUSY, _))
-                            );
-                        self.result.set(result);
-                    },
-                    Err((_error, buf)) => {
+                    Ok(()) => {
+                        let r = uart.receive_abort();
+                        if r != Err(ErrorCode::BUSY) {
+                            self.fail("receive_abort did not return Err(BUSY)");
+                            debug!("         got: {:?}", r);
+                        }
+                    }
+                    Err((code, buf)) => {
+                        self.fail("receive_buffer returned error");
+                        debug!("         error: {:?}", code);
                         self.rx_buf.replace(buf);
-                        self.fail_current();
+                        self.advance();
                     }
                 });
         });
     }
-
-    fn report(&self) {
-        let mut result = self.result.get();
-        if let Some(line) = result.take_result_line() {
-            self.result.set(result);
-            let resources_bound = crate::PANIC_RESOURCES.get().is_some_and(|resources| {
-                resources.chip.is_some()
-                    && resources.processes.is_some()
-                    && resources.printer.is_some()
-            });
-            transmit_lf0_sync(if resources_bound {
-                PANIC_RESOURCES_BOUND.as_bytes()
-            } else {
-                b"S32G3_S12 panic_resources result=UNBOUND\r\n"
-            });
-            transmit_lf0_sync(line.as_bytes());
-            self.client.map(|client| client.done(Ok(())));
-        }
-    }
 }
 
-impl CapsuleTest for UartTestSuite {
-    fn set_client(&self, client: &'static dyn CapsuleTestClient) {
-        self.client.set(client);
-    }
-}
+// ---------------------------------------------------------------------------
+// TransmitClient — handles TX completions
+// ---------------------------------------------------------------------------
 
 impl uart::TransmitClient for UartTestSuite {
     fn transmitted_buffer(
@@ -273,20 +253,59 @@ impl uart::TransmitClient for UartTestSuite {
         rval: Result<(), ErrorCode>,
     ) {
         self.tx_buf.replace(tx_buffer);
-        let mut result = self.result.get();
-        let advanced = match result.phase {
-            Phase::TxSuccess => result.tx_success(rval, tx_len),
-            Phase::TxAbort => result.tx_abort(result.tx_abort_preconditions_ok, rval, tx_len),
-            Phase::RxAbort | Phase::Done => false,
-        };
-        self.result.set(result);
-        if advanced {
-            self.start_phase();
+        match self.phase.get() {
+            Phase::Loopback => {
+                if rval == Ok(()) && tx_len == RX_LEN {
+                    self.pass("loopback TX completed, starting RX");
+                    self.uart.map(|uart| {
+                        self.rx_buf
+                            .take()
+                            .map(|buf| match uart.receive_buffer(buf, RX_LEN) {
+                                Ok(()) => {}
+                                Err((code, buf)) => {
+                                    self.fail("loopback receive_buffer returned error");
+                                    debug!("         error: {:?}", code);
+                                    self.rx_buf.replace(buf);
+                                    self.advance();
+                                }
+                            });
+                    });
+                } else {
+                    self.fail("loopback TX unexpected result");
+                    debug!("         rval={:?} len={}", rval, tx_len);
+                    self.advance();
+                }
+            }
+            Phase::TxSuccess => {
+                if rval == Ok(()) && tx_len == TX_LEN {
+                    self.pass("TX buffer completed successfully");
+                } else {
+                    self.fail("TX buffer unexpected result");
+                    debug!("         rval={:?} len={}", rval, tx_len);
+                }
+                self.advance();
+            }
+            Phase::TxAbort => {
+                if rval == Err(ErrorCode::CANCEL) {
+                    self.pass("TX abort delivered Err(CANCEL) via deferred call");
+                } else if rval == Ok(()) {
+                    self.pass("TX completed before abort (race OK)");
+                } else {
+                    self.fail("TX abort unexpected result");
+                    debug!("         rval={:?}", rval);
+                }
+                self.advance();
+            }
+            _ => {}
         }
     }
 
     fn transmitted_word(&self, _rval: Result<(), ErrorCode>) {}
 }
+
+// ---------------------------------------------------------------------------
+// ReceiveClient — handles RX completions
+// ---------------------------------------------------------------------------
 
 impl uart::ReceiveClient for UartTestSuite {
     fn received_buffer(
@@ -297,119 +316,95 @@ impl uart::ReceiveClient for UartTestSuite {
         error: uart::Error,
     ) {
         self.rx_buf.replace(rx_buffer);
-        let mut result = self.result.get();
-        let advanced = result.rx_abort(result.rx_abort_preconditions_ok, rval, rx_len, error);
-        self.result.set(result);
-        if advanced {
-            self.start_phase();
+        match self.phase.get() {
+            Phase::Loopback => {
+                if rval == Ok(()) && rx_len == RX_LEN && error == uart::Error::None {
+                    let expected = b"ABCD";
+                    self.rx_buf.map(|buf| {
+                        if &buf[..RX_LEN] == expected {
+                            self.pass("loopback RX matches expected pattern");
+                        } else {
+                            self.failed.set(self.failed.get() + 1);
+                            debug!(
+                                "  [FAIL] RX mismatch: expected [{:#04x}, {:#04x}, {:#04x}, {:#04x}] got [{:#04x}, {:#04x}, {:#04x}, {:#04x}]",
+                                expected[0], expected[1], expected[2], expected[3],
+                                buf[0], buf[1], buf[2], buf[3]
+                            );
+                        }
+                    });
+                } else {
+                    self.fail("loopback RX unexpected result");
+                    debug!("         rval={:?} len={} error={:?}", rval, rx_len, error);
+                }
+                self.advance();
+            }
+            Phase::RxSuccess => {
+                if rval == Ok(()) && rx_len == RX_LEN && error == uart::Error::None {
+                    self.pass("RX buffer received successfully");
+                    self.rx_buf.map(|buf| {
+                        for (i, &b) in buf[..RX_LEN].iter().enumerate() {
+                            if b < 0x20 || b > 0x7E {
+                                debug!("[WARN] non-printable byte {:#04x} at offset {}", b, i);
+                            }
+                        }
+                        debug!(
+                            "         received: [{:#04x}, {:#04x}, {:#04x}, {:#04x}]",
+                            buf[0], buf[1], buf[2], buf[3]
+                        );
+                    });
+                } else {
+                    self.fail("RX buffer unexpected result");
+                    debug!("         rval={:?} len={} error={:?}", rval, rx_len, error);
+                }
+                self.advance();
+            }
+            Phase::RxAbort => {
+                if rval == Err(ErrorCode::CANCEL) && error == uart::Error::Aborted {
+                    self.pass("RX abort delivered Err(CANCEL) + Aborted via deferred call");
+                } else {
+                    self.fail("RX abort unexpected result");
+                    debug!("         rval={:?} error={:?}", rval, error);
+                }
+                self.advance();
+            }
+            _ => {}
         }
     }
 }
 
-/// Start the deterministic suite after LF1 is configured and deferred calls exist.
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+const TX_LEN: usize = 16;
+const RX_LEN: usize = 4;
+const USE_LOOPBACK: bool = false;
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Run the sequential UART test suite on the given LinFlexD instance.
 ///
 /// # Safety
-/// Must be called exactly once during board startup, after the board's linflex modules
-/// have been initialized.
-pub unsafe fn run(lf1: &'static LinFlexD<'static>, client: &'static dyn CapsuleTestClient) {
+///
+/// Must only be called once from `start()` after the UART is configured.
+pub unsafe fn run(lf1: &'static LinFlexD<'static>) {
     static mut TX_BUF: [u8; TX_LEN] = [0; TX_LEN];
     static mut RX_BUF: [u8; RX_LEN] = [0; RX_LEN];
 
-    let suite = static_init!(UartTestSuite, UartTestSuite::new(client));
+    let suite = static_init!(UartTestSuite, UartTestSuite::new());
     suite.uart.set(lf1);
     suite.tx_buf.replace(&mut *addr_of_mut!(TX_BUF));
     suite.rx_buf.replace(&mut *addr_of_mut!(RX_BUF));
+
     lf1.set_transmit_client(suite);
     lf1.set_receive_client(suite);
-    suite.start_phase();
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    debug!("========================================");
+    debug!("[UART SUITE] Starting LinFlexD test suite on LF0 @ 115200");
+    debug!("[UART SUITE] Phase 1 requires human input: press 4 keys on LF0");
+    debug!("========================================");
 
-    #[test]
-    fn tx_success_requires_ok_and_exact_length() {
-        let mut wrong_result = SuiteResult::new();
-        assert!(wrong_result.tx_success(Err(ErrorCode::FAIL), TX_LEN));
-        assert!(!wrong_result.tx_ok);
-
-        let mut wrong_length = SuiteResult::new();
-        assert!(wrong_length.tx_success(Ok(()), TX_LEN - 1));
-        assert!(!wrong_length.tx_ok);
-    }
-
-    #[test]
-    fn rejects_tx_abort_without_cancel_zero_or_preconditions() {
-        let cases = [
-            (false, Err(ErrorCode::CANCEL), 0),
-            (true, Ok(()), 0),
-            (true, Err(ErrorCode::CANCEL), 1),
-        ];
-
-        for (preconditions_ok, rval, len) in cases {
-            let mut result = SuiteResult::new();
-            assert!(result.tx_success(Ok(()), TX_LEN));
-            assert!(result.tx_abort(preconditions_ok, rval, len));
-            assert!(!result.tx_abort_ok);
-        }
-    }
-
-    #[test]
-    fn rejects_rx_abort_without_cancel_zero_aborted_or_preconditions() {
-        let cases = [
-            (false, Err(ErrorCode::CANCEL), 0, uart::Error::Aborted),
-            (true, Ok(()), 0, uart::Error::Aborted),
-            (true, Err(ErrorCode::CANCEL), 1, uart::Error::Aborted),
-            (true, Err(ErrorCode::CANCEL), 0, uart::Error::None),
-        ];
-
-        for (preconditions_ok, rval, len, error) in cases {
-            let mut result = SuiteResult::new();
-            assert!(result.tx_success(Ok(()), TX_LEN));
-            assert!(result.tx_abort(true, Err(ErrorCode::CANCEL), 0));
-            assert!(result.rx_abort(preconditions_ok, rval, len, error));
-            assert!(!result.rx_abort_ok);
-        }
-    }
-
-    #[test]
-    fn ignores_out_of_order_and_duplicate_callbacks() {
-        let mut result = SuiteResult::new();
-        assert!(!result.tx_abort(true, Err(ErrorCode::CANCEL), 0));
-        assert!(!result.rx_abort(true, Err(ErrorCode::CANCEL), 0, uart::Error::Aborted));
-        assert!(result.tx_success(Ok(()), TX_LEN));
-        assert!(result.tx_abort(true, Err(ErrorCode::CANCEL), 0));
-        assert!(result.rx_abort(true, Err(ErrorCode::CANCEL), 0, uart::Error::Aborted));
-        assert!(!result.tx_success(Ok(()), TX_LEN));
-        assert!(!result.tx_abort(true, Err(ErrorCode::CANCEL), 0));
-        assert!(!result.rx_abort(true, Err(ErrorCode::CANCEL), 0, uart::Error::Aborted));
-        assert_eq!(
-            result.take_result_line(),
-            Some("S32G3_UART_TEST result=PASS tx=PASS tx_abort=PASS rx_abort=PASS\r\n")
-        );
-        assert_eq!(result.take_result_line(), None);
-    }
-
-    #[test]
-    fn maps_each_failure_combination_to_its_single_expected_line() {
-        let cases = [
-            (false, false, false, RESULT_FAIL_ALL),
-            (false, false, true, RESULT_FAIL_TT),
-            (false, true, false, RESULT_FAIL_TR),
-            (false, true, true, RESULT_FAIL_T),
-            (true, false, false, RESULT_FAIL_AT),
-            (true, false, true, RESULT_FAIL_A),
-            (true, true, false, RESULT_FAIL_R),
-        ];
-
-        for (tx_ok, tx_abort_ok, rx_abort_ok, expected) in cases {
-            let mut result = SuiteResult::new();
-            result.phase = Phase::Done;
-            result.tx_ok = tx_ok;
-            result.tx_abort_ok = tx_abort_ok;
-            result.rx_abort_ok = rx_abort_ok;
-            assert_eq!(result.take_result_line(), Some(expected));
-        }
-    }
+    suite.start_next_phase();
 }

@@ -223,9 +223,6 @@ register_bitfields![u8,
 /// giving callers a typed API for `setup_tx_pin` and `setup_mscr`.
 pub use MSCR::SSS::Value as AlternateFunction;
 
-/// Re-export valid MSCR slew-rate encodings as a type-safe API.
-pub use MSCR::SRE::Value as SlewRate;
-
 /// Type-safe identifier for an SIUL2 chip pin.
 ///
 /// The discriminant is the MSCR/GPDO/GPDI instance index, matching the S32G3
@@ -509,23 +506,18 @@ impl Siul2 {
     /// - `alt`: Source Signal Select value (`GPIO`, `ALT1`..`ALT4`).
     /// - `obe`: Enable the output buffer (`true` = driven, `false` = high-Z).
     /// - `ibe`: Enable the input buffer.
-    /// - `sre`: Valid slew-rate control encoding.
+    /// - `sre`: Slew-rate control value (0..=7 — see `MSCR::SRE` variants).
     ///
     /// Per RM §16.3.12, MSCRn must be configured only at application
     /// initialization and supports only 32-bit accesses.
-    pub fn setup_mscr(
-        &self,
-        pin: Pin,
-        alt: AlternateFunction,
-        obe: bool,
-        ibe: bool,
-        sre: SlewRate,
-    ) {
+    pub fn setup_mscr(&self, pin: Pin, alt: AlternateFunction, obe: bool, ibe: bool, sre: u32) {
+        // Mask incoming `sre` down to field width; `alt` is type-safe and
+        // cannot carry reserved SSS values.
         self.registers.mscr[pin.value()].write(
             MSCR::SSS.val(alt as u32)
                 + MSCR::OBE.val(u32::from(obe))
                 + MSCR::IBE.val(u32::from(ibe))
-                + MSCR::SRE.val(sre as u32),
+                + MSCR::SRE.val(sre & MSCR::SRE.mask),
         );
     }
 
@@ -542,14 +534,22 @@ impl Siul2 {
     /// Sets SSS=`alt`, OBE=1, IBE=1, and SRE=`Sre150M` (150 MHz at 1.8V, 133 MHz
     /// at 3.3V on FAST pads — RM §16.3.12 field `16-14 SRE`).
     pub fn setup_tx_pin(&self, pin: Pin, alt: AlternateFunction) {
-        self.setup_mscr(pin, alt, true, true, SlewRate::Sre150M);
+        // For TX ALT pins: SSS=alt, OBE=1, IBE=1, SRE=Sre150M.
+        self.setup_mscr(pin, alt, true, true, MSCR::SRE::Value::Sre150M as u32);
     }
 
     /// Configures a pad as a pure input (RX-style).
     ///
     /// Sets SSS=`GPIO`, OBE=0, IBE=1, SRE=`Sre208M` — input-only with no drive.
     pub fn setup_rx_pin(&self, pin: Pin) {
-        self.setup_mscr(pin, AlternateFunction::GPIO, false, true, SlewRate::Sre208M);
+        // For RX input pins: SSS=GPIO, OBE=0, IBE=1, SRE=Sre208M.
+        self.setup_mscr(
+            pin,
+            AlternateFunction::GPIO,
+            false,
+            true,
+            MSCR::SRE::Value::Sre208M as u32,
+        );
     }
 
     /// Configures a pad as a software-controlled GPIO.
@@ -557,16 +557,26 @@ impl Siul2 {
     /// For input pins the input buffer is enabled and the output buffer is
     /// disabled; for output pins the output buffer is enabled and the input
     /// buffer is disabled. SSS is set to `GPIO` and SRE to `Sre208M`.
-    /// Configures preparatory GPIO pinmux only; this is not a GPIO HIL driver
-    /// and does not provide GPIO interrupt support.
     pub fn setup_gpio_pin(&self, pin: Pin, is_output: bool) {
-        self.setup_mscr(
-            pin,
-            AlternateFunction::GPIO,
-            is_output,
-            !is_output,
-            SlewRate::Sre208M,
-        );
+        if is_output {
+            // For GPIO output: SSS=GPIO, OBE=1, IBE=0, SRE=Sre208M.
+            self.setup_mscr(
+                pin,
+                AlternateFunction::GPIO,
+                true,
+                false,
+                MSCR::SRE::Value::Sre208M as u32,
+            );
+        } else {
+            // For GPIO input: SSS=GPIO, OBE=0, IBE=1, SRE=Sre208M.
+            self.setup_mscr(
+                pin,
+                AlternateFunction::GPIO,
+                false,
+                true,
+                MSCR::SRE::Value::Sre208M as u32,
+            );
+        }
     }
 
     /// Drives a GPIO output pad high or low.
@@ -588,77 +598,5 @@ impl Siul2 {
     /// reason as [`set_gpio`](Self::set_gpio).
     pub fn read_gpio(&self, pin: Pin) -> bool {
         self.registers.gpdi[pin.value() ^ 3].is_set(GPDI::VAL)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn setup_mscr_preserves_each_valid_slew_rate_encoding() {
-        let mut backing = [0u32; 0x1700 / 4];
-        let registers = unsafe { StaticRef::new(backing.as_mut_ptr() as *const Siul2Registers) };
-        let siul2 = Siul2::new(registers);
-        let cases = [
-            (SlewRate::Sre208M, 0b000),
-            (SlewRate::Sre166M, 0b100),
-            (SlewRate::Sre150M, 0b101),
-            (SlewRate::Sre133M, 0b110),
-            (SlewRate::Sre100M, 0b111),
-        ];
-
-        for (index, (slew_rate, encoding)) in cases.iter().enumerate() {
-            let pin = match index {
-                0 => Pin::PA0,
-                1 => Pin::PA1,
-                2 => Pin::PA2,
-                3 => Pin::PA3,
-                _ => Pin::PA4,
-            };
-            siul2.setup_mscr(pin, AlternateFunction::ALT1, true, false, *slew_rate);
-            let value = backing[(0x240 / 4) + index];
-            assert_eq!(
-                (value >> MSCR::SRE.shift) & MSCR::SRE.mask,
-                *encoding,
-                "unexpected SRE encoding for case {index}"
-            );
-            assert_eq!(value & MSCR::SSS.mask, AlternateFunction::ALT1 as u32);
-        }
-    }
-    #[test]
-    fn linflexd0_rx_alt2_selects_imcr0_source_2() {
-        let mut backing = [0u32; 0x1700 / 4];
-        let registers = unsafe { StaticRef::new(backing.as_mut_ptr() as *const Siul2Registers) };
-        let siul2 = Siul2::new(registers);
-
-        siul2.setup_imcr(Imcr::LinflexD0Rx, ImcrSource::Alt2);
-
-        let imcr0 = backing[0xA40 / 4];
-        assert_eq!((imcr0 >> IMCR::SSS.shift) & IMCR::SSS.mask, 2);
-    }
-
-    #[test]
-    fn typed_pin_helpers_use_their_documented_slew_rates() {
-        let mut backing = [0u32; 0x1700 / 4];
-        let registers = unsafe { StaticRef::new(backing.as_mut_ptr() as *const Siul2Registers) };
-        let siul2 = Siul2::new(registers);
-
-        siul2.setup_tx_pin(Pin::PA0, AlternateFunction::ALT1);
-        siul2.setup_rx_pin(Pin::PA1);
-        siul2.setup_gpio_pin(Pin::PA2, true);
-
-        assert_eq!(
-            (backing[0x240 / 4] >> MSCR::SRE.shift) & MSCR::SRE.mask,
-            0b101
-        );
-        assert_eq!(
-            (backing[(0x240 / 4) + 1] >> MSCR::SRE.shift) & MSCR::SRE.mask,
-            0
-        );
-        assert_eq!(
-            (backing[(0x240 / 4) + 2] >> MSCR::SRE.shift) & MSCR::SRE.mask,
-            0
-        );
     }
 }

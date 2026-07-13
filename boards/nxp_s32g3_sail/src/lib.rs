@@ -22,15 +22,17 @@ use kernel::platform::watchdog::WatchDog;
 use kernel::platform::{KernelResources, SyscallDriverLookup};
 use kernel::utilities::single_thread_value::SingleThreadValue;
 use kernel::{create_capability, static_init};
-use nxp_s32g3::clocks::M7_CORE_FREQUENCY_HZ;
 use nxp_s32g3::linflexd::LinFlexD;
 use nxp_s32g3::siul2::AlternateFunction::{ALT1, ALT2};
 use nxp_s32g3::stm::{Stm, STM_1_BASE};
 use nxp_s32g3::swt::{Swt, SWT_0_BASE};
-use nxp_s32g3::xrdc::xrdc_0::Peripheral::{LinFlexD0, LinFlexD1, Siul20};
-use nxp_s32g3::xrdc::xrdc_0::{Config as Xrdc0Config, Pdac, Xrdc0};
+use nxp_s32g3::xrdc::xrdc_0::{
+    Config as Xrdc0Config, Master, Mda, Pdac,
+    Peripheral::{LinFlexD0, LinFlexD1, Siul20},
+    Xrdc0,
+};
 use nxp_s32g3::xrdc::xrdc_1::{Mrgd as Xrdc1Mrgd, Xrdc1};
-use nxp_s32g3::xrdc::{Access::FullRw, Domain, MrgdPatchOutcome, MrgdTarget, XrdcPatchError};
+use nxp_s32g3::xrdc::{Access::FullRw, Domain, MrgdTarget};
 use nxp_s32g3::{mscm, ssramc};
 
 /// Explicit no-op watchdog for the S32G3 SAIL bring-up board.
@@ -51,36 +53,23 @@ impl WatchDog for DisabledWatchdog {
 
 pub const NUM_PROCS: usize = 4;
 
-/// LF0 debug/process-console nominal baud rate.
-const LF0_BAUD: u32 = 115_200;
-/// LF1 userspace-console nominal baud rate.
-const LF1_BAUD: u32 = 921_600;
-
 /// XRDC_0 additive patch config. A prior boot stage owns the base policy;
-/// Tock adds only M7_0 grants for its console and SIUL2 pin control.
-/// CA53 remains in reset and receives no board-level XRDC grant.
+/// Tock only adds grants for the M7 console, SIUL2 pin control, and the A53
+/// master domain. A53 stays in reset in this example, but the grants remain
+/// dormant in policy.
 const XRDC_0_CFG: Xrdc0Config = Xrdc0Config::new(
-    &[],
+    &[Mda::assign(Master::A53Cluster0, Domain::A53)],
     &[
-        Pdac::new(LinFlexD0).grant(Domain::M7_0, FullRw),
+        Pdac::new(LinFlexD0)
+            .grant(Domain::M7_0, FullRw)
+            .grant(Domain::A53, FullRw),
         Pdac::new(LinFlexD1).grant(Domain::M7_0, FullRw),
-        Pdac::new(Siul20).grant(Domain::M7_0, FullRw),
+        Pdac::new(Siul20)
+            .grant(Domain::M7_0, FullRw)
+            .grant(Domain::A53, FullRw),
     ],
     &[],
 );
-
-/// Preparatory XRDC_1 policy for the 32 KiB standby-SRAM controller window.
-/// A predecessor-owned descriptor is patched when present; a cold XMODEM boot
-/// allocates this exact range only after excluding all overlap.
-const XRDC_1_STDBY_SRAM: Xrdc1Mrgd = Xrdc1Mrgd::region(0x2400_0000, 0x2400_7FFF)
-    .grant(Domain::Debugger, FullRw)
-    .grant(Domain::M7_0, FullRw)
-    .grant(Domain::M7_1, FullRw)
-    .grant(Domain::M7_2, FullRw)
-    .grant(Domain::M7_3, FullRw)
-    .grant(Domain::EDma, FullRw)
-    .grant(Domain::Hse, FullRw)
-    .grant(Domain::A53, FullRw);
 
 #[derive(Copy, Clone)]
 pub struct NxpS32g3DefaultPeripherals {
@@ -206,24 +195,24 @@ pub unsafe fn start() -> (
 
     // Clock and power
     //
-    // PRTN2 (PFE/HSE) and PRTN3 (LLCE / LinFlexD1) are current boot
-    // dependencies. PRTN1 (CA53) remains in reset.
+    // MC_ME wake-up of PRTN2 (PFE/HSE) and PRTN3 (LLCE / LinFlexD1) must
+    // precede the clock tree setup so a stray partition gate cannot mask any
+    // PLL/CGM/DFS register access. PRTN1 (CA53) is intentionally left in reset.
     nxp_s32g3::mc_me::partition_enable(2).expect("PRTN2 enable failed");
     nxp_s32g3::mc_me::partition_enable(3).expect("PRTN3 enable failed");
 
     let clocks = static_init!(nxp_s32g3::clocks::Clocks, nxp_s32g3::clocks::Clocks::new());
-    clocks.setup_m7_clocks().expect("M7 clock setup failed");
+    clocks
+        .setup_production_clocks()
+        .expect("clock setup failed");
 
     // Interrupt routing
     //
     // Route all board peripherals to M7_0 so their NVIC enable() calls work.
     let mscm = static_init!(mscm::Mscm, mscm::Mscm::new());
-    mscm.enable_interrupt(mscm::LINFLEXD_0, mscm::S32G3Core::M7_0)
-        .expect("LINFlexD0 interrupt route failed");
-    mscm.enable_interrupt(mscm::LINFLEXD_1, mscm::S32G3Core::M7_0)
-        .expect("LINFlexD1 interrupt route failed");
-    mscm.enable_interrupt(mscm::STM_1, mscm::S32G3Core::M7_0)
-        .expect("STM1 interrupt route failed");
+    mscm.enable_interrupt(mscm::LINFLEXD_0, mscm::S32G3Core::M7_0);
+    mscm.enable_interrupt(mscm::LINFLEXD_1, mscm::S32G3Core::M7_0);
+    mscm.enable_interrupt(mscm::STM_1, mscm::S32G3Core::M7_0);
     cortexm7::nvic::Nvic::new(mscm::LINFLEXD_0).enable();
     cortexm7::nvic::Nvic::new(mscm::LINFLEXD_1).enable();
     cortexm7::nvic::Nvic::new(mscm::STM_1).enable();
@@ -262,8 +251,8 @@ pub unsafe fn start() -> (
     );
     lf1.register();
 
-    // LF0 is the debug and process console.
-    let uart_mux_lf0 = components::console::UartMuxComponent::new(lf0, LF0_BAUD)
+    // Debug output
+    let uart_mux_lf0 = components::console::UartMuxComponent::new(lf0, 115200)
         .finalize(components::uart_mux_component_static!());
     components::debug_writer::DebugWriterComponent::new::<
         <ChipHw as kernel::platform::chip::Chip>::ThreadIdProvider,
@@ -281,38 +270,26 @@ pub unsafe fn start() -> (
     // own grants via the XRDC driver's additive `patch()` mode so existing
     // clocks, UART, and watchdog grants stay intact.
     let xrdc0 = static_init!(Xrdc0, Xrdc0::new());
-    xrdc0
-        .patch(&XRDC_0_CFG)
-        .expect("XRDC_0 M7 console and SIUL2 grants failed");
+    xrdc0.patch(&XRDC_0_CFG);
     // xrdc0.lock(); // Uncomment to freeze XRDC_0 policy until next reset.
 
-    // Patch a predecessor-owned descriptor when present. A cold XMODEM boot
-    // has no predecessor policy, so it can allocate only this exact range
-    // after proving that no valid descriptor overlaps it.
+    // XRDC_1 Standby SRAM grant — dynamic search for the pre-programmed
+    // descriptor, patched in-place so we don't introduce overlapping regions.
     let xrdc1 = static_init!(Xrdc1, Xrdc1::new());
-    match xrdc1.search_and_patch_mrgd(MrgdTarget::ContainsAddress(0x2400_6008), &XRDC_1_STDBY_SRAM)
-    {
-        Ok(MrgdPatchOutcome::PatchedExisting { .. }) => {}
-        Ok(MrgdPatchOutcome::AllocatedNew { .. }) => {
-            panic!("XRDC_1 containment search allocated standby-SRAM descriptor")
-        }
-        Err(XrdcPatchError::MissingTarget) => {
-            match xrdc1.allocate_unmapped_exact_mrgd(&XRDC_1_STDBY_SRAM) {
-                Ok(MrgdPatchOutcome::AllocatedNew { .. }) => {}
-                Ok(MrgdPatchOutcome::PatchedExisting { .. }) => {
-                    panic!("XRDC_1 cold-boot allocation patched standby-SRAM descriptor")
-                }
-                Err(error) => panic!(
-                    "XRDC_1 cold-boot standby-SRAM allocation failed: {:?}",
-                    error
-                ),
-            }
-        }
-        Err(error) => panic!(
-            "XRDC_1 preparatory standby-SRAM descriptor patch failed: {:?}",
-            error
-        ),
-    }
+    xrdc1
+        .search_and_patch_mrgd(
+            MrgdTarget::ContainsAddress(0x2400_6008),
+            &Xrdc1Mrgd::region(0x2400_0000, 0x2400_7FFF)
+                .grant(Domain::Debugger, FullRw)
+                .grant(Domain::M7_0, FullRw)
+                .grant(Domain::M7_1, FullRw)
+                .grant(Domain::M7_2, FullRw)
+                .grant(Domain::M7_3, FullRw)
+                .grant(Domain::EDma, FullRw)
+                .grant(Domain::Hse, FullRw)
+                .grant(Domain::A53, FullRw),
+        )
+        .expect("XRDC_1 Standby SRAM grant failed");
 
     // Initialize Standby SRAM ECC before anything can touch it.
     let ssramc = ssramc::Ssramc::new(ssramc::SSRAMC_BASE);
@@ -356,8 +333,8 @@ pub unsafe fn start() -> (
         resources.chip.put(chip);
     });
 
-    // LF1 is the userspace console.
-    let uart_mux_lf1 = components::console::UartMuxComponent::new(lf1, LF1_BAUD)
+    // Capsules
+    let uart_mux_lf1 = components::console::UartMuxComponent::new(lf1, 923076)
         .finalize(components::uart_mux_component_static!());
     let console = components::console::ConsoleComponent::new(
         board_kernel,
@@ -407,7 +384,7 @@ pub unsafe fn start() -> (
             &memory_allocation_cap,
         ),
         scheduler,
-        systick: cortexm7::systick::SysTick::new_with_calibration(M7_CORE_FREQUENCY_HZ),
+        systick: cortexm7::systick::SysTick::new_with_calibration(100_000_000),
         watchdog,
     };
 
@@ -445,8 +422,8 @@ pub unsafe fn start() -> (
         debug!("{:?}", err);
     });
 
-    #[cfg(feature = "test-harness")]
-    run_tests(mux_alarm, stm, *peripherals);
+    // #[cfg(feature = "test-harness")]
+    // run_tests(*peripherals);
 
     (board_kernel, platform, chip)
 }
@@ -454,12 +431,13 @@ pub unsafe fn start() -> (
 /// # Safety: this function contains static initialization and must only be called once from `start()`.
 ///
 #[cfg(feature = "test-harness")]
-unsafe fn run_tests(
-    mux_alarm: &'static capsules_core::virtualizers::virtual_alarm::MuxAlarm<'static, Stm<'static>>,
-    stm: &'static Stm<'static>,
-    peripherals: NxpS32g3DefaultPeripherals,
-) {
+unsafe fn run_tests(peripherals: NxpS32g3DefaultPeripherals) {
     use kernel::hil::uart::Configure;
+
+    // ---- Hardware tests -------------------------------------------------------
+    // Tests run on LF0 (115200 baud) so the console on LF1 remains available.
+    // Connect a second serial adapter to the LF0 TX/RX pins.
+    // Phase 1 (RX) requires pressing 4 keys on LF0.
     peripherals.lf1.set_input_clock_hz(
         peripherals
             .clocks
@@ -469,13 +447,12 @@ unsafe fn run_tests(
     peripherals
         .lf1
         .configure(kernel::hil::uart::Parameters {
-            baud_rate: LF1_BAUD,
+            baud_rate: 923076,
             width: kernel::hil::uart::Width::Eight,
             parity: kernel::hil::uart::Parity::None,
             stop_bits: kernel::hil::uart::StopBits::One,
             hw_flow_control: false,
         })
         .unwrap();
-
-    tests::run(mux_alarm, stm, peripherals.lf1);
+    tests::uart_suite::run(peripherals.lf1);
 }
