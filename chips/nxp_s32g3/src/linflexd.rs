@@ -6,9 +6,8 @@
 //!
 //! Register definitions and bitfields are taken from S32G3 RM §49.5.
 //!
-//! Only UART mode is implemented (not LIN). The hardware supports 8N1, 9-bit,
-//! 16-bit, and 17-bit frames with configurable parity and stop bits. This
-//! driver uses buffer mode (not FIFO) with interrupt-driven TX/RX.
+//! Only asynchronous 8N1 buffer UART mode is implemented (not LIN). The driver
+//! uses buffer mode (not FIFO) with interrupt-driven TX/RX.
 
 use core::cell::Cell;
 
@@ -417,6 +416,41 @@ register_bitfields![u32,
 // caller should propagate an error rather than silently continuing.
 const HW_POLL_MAX: u32 = 200_000;
 
+/// Integer LINFlexD baud-divisor calculation from RM §49.4.2.14.
+///
+/// `integer_divisor` and `fractional_divisor` encode `LDIV` as IBR and FBR;
+/// the fractional value is in sixteenths. `actual_baud` and `error_hz` make
+/// the quantization error explicit to board configuration and host tests.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct BaudRate {
+    integer_divisor: u32,
+    fractional_divisor: u32,
+    actual_baud: u32,
+    error_hz: u32,
+}
+
+/// Calculates the closest representable baud rate for a LIN_BAUD_CLK input.
+fn calculate_baud(input_clock_hz: u32, requested_baud: u32) -> Result<BaudRate, ErrorCode> {
+    if input_clock_hz == 0 || requested_baud == 0 {
+        return Err(ErrorCode::INVAL);
+    }
+
+    let divisor_in_sixteenths =
+        ((input_clock_hz as u64) + (requested_baud as u64 / 2)) / requested_baud as u64;
+    let integer_divisor = divisor_in_sixteenths / 16;
+    if integer_divisor == 0 || integer_divisor > 0xF_FFFF {
+        return Err(ErrorCode::NOSUPPORT);
+    }
+
+    let actual_baud = (input_clock_hz as u64 / divisor_in_sixteenths) as u32;
+    Ok(BaudRate {
+        integer_divisor: integer_divisor as u32,
+        fractional_divisor: (divisor_in_sixteenths % 16) as u32,
+        actual_baud,
+        error_hz: actual_baud.abs_diff(requested_baud),
+    })
+}
+
 // ---------------------------------------------------------------------------
 // Deferred-call state for TX/RX abort notifications
 // ---------------------------------------------------------------------------
@@ -425,7 +459,7 @@ const HW_POLL_MAX: u32 = 200_000;
 enum TxState {
     Idle,
     Transmitting,
-    Aborted(Result<(), ErrorCode>),
+    Aborted(Result<(), ErrorCode>, usize),
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -449,7 +483,8 @@ pub struct LinFlexD<'a> {
     rx_client: OptionalCell<&'a dyn uart::ReceiveClient>,
     tx_buffer: TakeCell<'static, [u8]>,
     tx_len: Cell<usize>,
-    tx_index: Cell<usize>,
+    tx_queued: Cell<usize>,
+    tx_confirmed: Cell<usize>,
     rx_buffer: TakeCell<'static, [u8]>,
     rx_len: Cell<usize>,
     rx_index: Cell<usize>,
@@ -458,7 +493,7 @@ pub struct LinFlexD<'a> {
     deferred_call: DeferredCall,
     /// LIN_BAUD_CLK input frequency in Hz used to compute IBR/FBR.
     /// Defaults to FIRC (48 MHz) — caller must update via
-    /// [`set_input_clock_hz`] after switching MC_CGM_0 mux 8.
+    /// [`Self::set_input_clock_hz`] after switching MC_CGM_0 mux 8.
     input_clock_hz: Cell<u32>,
 }
 
@@ -468,7 +503,7 @@ impl LinFlexD<'_> {
     // ---------------------------------------------------------------------------
 
     /// Create a new `LinFlexD` bound to `base`.  The instance is inert until
-    /// [`configure`](Hil::uart::Configure::configure) succeeds.
+    /// [`Configure::configure`] succeeds.
     pub fn new(base: StaticRef<LinFlexDRegisters>) -> Self {
         Self {
             registers: base,
@@ -476,7 +511,8 @@ impl LinFlexD<'_> {
             rx_client: OptionalCell::empty(),
             tx_buffer: TakeCell::empty(),
             tx_len: Cell::new(0),
-            tx_index: Cell::new(0),
+            tx_queued: Cell::new(0),
+            tx_confirmed: Cell::new(0),
             rx_buffer: TakeCell::empty(),
             rx_len: Cell::new(0),
             rx_index: Cell::new(0),
@@ -509,9 +545,9 @@ impl LinFlexD<'_> {
     // Private helpers
     // ---------------------------------------------------------------------------
 
-    /// Busy-wait until LINSR[LINS] == INIT mode.
-    /// RM does not talk about how long it takes to enter init mode after setting LINCR1[INIT]
-    /// NXP driver does the poll. We assume it is needed to ensure state machine is correctly reset before we proceed with configuration.
+    /// Busy-wait until `LINSR[LINS] == INIT`.
+    /// RM does not specify the transition latency after setting `LINCR1[INIT]`;
+    /// the NXP driver polls so configuration starts from reset state.
     /// Kept inline because it is a short loop body called once per configure.
     #[inline]
     fn wait_for_init_mode(&self) -> bool {
@@ -529,9 +565,13 @@ impl LinFlexD<'_> {
     }
 
     fn disable_rx_interrupt(&self) {
-        self.registers
-            .linier
-            .modify(LINIER::DRIE::CLEAR + LINIER::TOIE::CLEAR + LINIER::BOIE::CLEAR);
+        self.registers.linier.modify(
+            LINIER::DRIE::CLEAR
+                + LINIER::TOIE::CLEAR
+                + LINIER::BOIE::CLEAR
+                + LINIER::FEIE::CLEAR
+                + LINIER::SZIE::CLEAR,
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -540,87 +580,83 @@ impl LinFlexD<'_> {
 
     fn tx_progress(&self) {
         let regs = self.registers;
-        let idx = self.tx_index.get();
-        let len = self.tx_len.get();
-        if idx >= len {
+        let queued = self.tx_queued.get();
+        if queued >= self.tx_len.get() {
             return;
         }
-        self.tx_buffer.map(|tx_buf| {
-            regs.bdrl.write(BDRL::DATA0.val(tx_buf[idx] as u32));
+        self.tx_buffer.map(|tx_buffer| {
+            regs.bdrl.write(BDRL::DATA0.val(tx_buffer[queued] as u32));
         });
-        self.tx_index.set(idx + 1);
-    }
-
-    fn is_transmitting(&self) -> bool {
-        self.tx_state.get() == TxState::Transmitting
+        self.tx_queued.set(queued + 1);
     }
 
     /// Called by the platform interrupt handler.
     ///
     /// Clears relevant status flags and drives TX/RX progress.
-    // TODO: implement DMA support
     pub fn handle_interrupt(&self) {
         let regs = self.registers;
         let uartsr = regs.uartsr.extract();
         let linier = regs.linier.extract();
         // ---- TX completion ---------------------------------------------------
         if uartsr.is_set(UARTSR::DTFTFF) && linier.is_set(LINIER::DTIE) {
-            // Clear the flag (W1C).
             regs.uartsr.write(UARTSR::DTFTFF::SET);
             self.disable_tx_interrupt();
+            self.tx_confirmed.set(self.tx_confirmed.get() + 1);
 
-            if self.tx_index.get() >= self.tx_len.get() {
+            if self.tx_confirmed.get() == self.tx_len.get() {
                 self.tx_state.set(TxState::Idle);
-                // All bytes transmitted; notify the client.
                 self.tx_client.map(|client| {
-                    if self
-                        .tx_buffer
-                        .take()
-                        .map(|buf| {
-                            client.transmitted_buffer(buf, self.tx_len.get(), Ok(()));
-                        })
-                        .is_none()
-                    {
-                        // if no buffer was taken, means we were sending a single word, so notify with transmitted_word callback
-                        client.transmitted_word(Ok(()));
-                    }
+                    self.tx_buffer.take().map(|buffer| {
+                        client.transmitted_buffer(buffer, self.tx_len.get(), Ok(()));
+                    });
                 });
             } else {
-                // More data to send.
                 self.tx_progress();
-                // Re-enable the TX interrupt for the next DTF.
                 regs.linier.modify(LINIER::DTIE::SET);
             }
         }
 
-        // ---- RX completion / timeout ----------------------------------------
-        if uartsr.is_set(UARTSR::DRFRFE) {
-            // DRF means the programmed number of bytes (RDFL+1) arrived.
-            // TO means the timeout counter expired; the last byte is still
-            // readable from BDRL.
-            if linier.is_set(LINIER::DRIE) {
+        // ---- RX errors and completion ----------------------------------------
+        if self.rx_state.get() == RxState::Receiving {
+            let receive_error = receive_error(uartsr);
+
+            if let Some(error) = receive_error {
                 self.disable_rx_interrupt();
+                regs.uartsr.write(
+                    UARTSR::RMB::SET
+                        + UARTSR::DRFRFE::SET
+                        + UARTSR::TO::SET
+                        + UARTSR::BOF::SET
+                        + UARTSR::FEF::SET
+                        + UARTSR::PE.val(0xF)
+                        + UARTSR::SZF::SET
+                        + UARTSR::NF::SET,
+                );
                 self.rx_state.set(RxState::Idle);
-
-                // Copy received bytes into the client buffer. In UART buffer
-                // mode the receive buffer is BDRM (RM §49.4.4.7 Table 331:
-                // "Read Byte4-5-6-7 / BUFFER → OK"); bytes 0..3 are BDRM
-                // DATA4..DATA7. BDRL is the TX buffer and must not be read here.
-                let idx = self.rx_index.get();
-                let len = self.rx_len.get();
-
-                if idx < len {
-                    self.rx_buffer.map(|rx_buf| {
-                        let written = read_rx_bytes(regs.bdrm.get(), &mut rx_buf[idx..len]);
-                        self.rx_index.set(idx + written);
+                self.rx_client.map(|client| {
+                    self.rx_buffer.take().map(|buf| {
+                        client.received_buffer(
+                            buf,
+                            self.rx_index.get(),
+                            Err(ErrorCode::FAIL),
+                            error,
+                        );
                     });
+                });
+                return;
+            }
 
-                    // Release the message buffer so hardware can accept more data.
-                    regs.uartsr.write(UARTSR::RMB::SET);
-                }
+            if uartsr.is_set(UARTSR::DRFRFE) && linier.is_set(LINIER::DRIE) {
+                let index = self.rx_index.get();
+                self.rx_buffer.map(|buffer| {
+                    buffer[index] = read_rx_byte(regs.bdrm.get());
+                });
+                self.rx_index.set(index + 1);
+                regs.uartsr.write(UARTSR::RMB::SET + UARTSR::DRFRFE::SET);
 
-                if self.rx_index.get() >= self.rx_len.get() {
-                    // Complete; notify the client.
+                if self.rx_index.get() == self.rx_len.get() {
+                    self.disable_rx_interrupt();
+                    self.rx_state.set(RxState::Idle);
                     self.rx_client.map(|client| {
                         self.rx_buffer.take().map(|buf| {
                             client.received_buffer(
@@ -632,46 +668,9 @@ impl LinFlexD<'_> {
                         });
                     });
                 } else {
-                    // More bytes expected; restart reception.
-                    regs.uartsr.write(UARTSR::RMB::SET);
-                    regs.linier
-                        .modify(LINIER::DRIE::SET + LINIER::TOIE::SET + LINIER::BOIE::SET);
+                    regs.linier.modify(LINIER::DRIE::SET);
                 }
             }
-        }
-
-        // ---- Timeout --------------------------------------------------------
-        if uartsr.is_set(UARTSR::TO) && linier.is_set(LINIER::TOIE) {
-            // Timeout fires when the inter-byte gap exceeds UARTPTO.
-            // In most cases this indicates the sender is done.
-            regs.uartsr.write(UARTSR::TO::SET);
-            // Deliver whatever we have accumulated.
-            let rx_len = self.rx_index.get();
-            if rx_len > 0 {
-                self.disable_rx_interrupt();
-                self.rx_state.set(RxState::Idle);
-                self.rx_client.map(|client| {
-                    self.rx_buffer.take().map(|buf| {
-                        client.received_buffer(buf, rx_len, Ok(()), uart::Error::None);
-                    });
-                });
-            }
-        }
-
-        // ---- Buffer overrun --------------------------------------------------
-        if uartsr.is_set(UARTSR::BOF) && linier.is_set(LINIER::BOIE) {
-            regs.uartsr.write(UARTSR::BOF::SET);
-            self.rx_state.set(RxState::Idle);
-            self.rx_client.map(|client| {
-                self.rx_buffer.take().map(|buf| {
-                    client.received_buffer(
-                        buf,
-                        self.rx_index.get(),
-                        Ok(()),
-                        uart::Error::OverrunError,
-                    );
-                });
-            });
         }
     }
 
@@ -690,21 +689,25 @@ impl LinFlexD<'_> {
         putc_poll(&self.registers, byte)
     }
 
-    /// Transmit all bytes in `s`.
-    pub fn puts(&self, s: &str) {
+    /// Transmit all bytes in `s`, returning the number confirmed by polling.
+    pub fn puts(&self, s: &str) -> usize {
         self.transmit_sync(s.as_bytes())
     }
 
-    /// Transmit all bytes in `bytes` synchronously, spinning until each byte drains.
+    /// Transmit bytes synchronously until one fails, returning the confirmed count.
     ///
     /// # PANIC-PATH ONLY
     /// Busy-waits per byte (bounded by `HW_POLL_MAX`; WCET ≈ 40 ms × `bytes.len()`
-    /// at 48 MHz FIRC).  **Only call from the panic handler or other contexts where
-    /// the kernel scheduler is permanently stopped.  Never call at runtime.**
-    pub fn transmit_sync(&self, bytes: &[u8]) {
-        for b in bytes.iter() {
-            self.putc(*b);
+    /// at 48 MHz FIRC). **Only call from panic or early-boot contexts.**
+    pub fn transmit_sync(&self, bytes: &[u8]) -> usize {
+        let mut sent = 0;
+        for &byte in bytes {
+            if !self.putc(byte) {
+                break;
+            }
+            sent += 1;
         }
+        sent
     }
 }
 
@@ -712,7 +715,7 @@ impl LinFlexD<'_> {
 // Shared polling TX primitive
 // ---------------------------------------------------------------------------
 
-/// Transmit one byte over the given LINFlexD instance by polling UARTSR[DTFTFF].
+/// Transmit one byte over the given LINFlexD instance by polling `UARTSR[DTFTFF]`.
 ///
 /// Returns `true` on success, `false` if the poll budget expired (byte lost).
 /// Used by `LinFlexD::putc` for synchronous polling output.
@@ -734,6 +737,24 @@ fn putc_poll(regs: &LinFlexDRegisters, byte: u8) -> bool {
     false
 }
 
+/// Transmit one byte through LF0 without creating a buffered UART instance.
+///
+/// Used exclusively by panic and early-boot output, where allocating a
+/// [`DeferredCall`] would consume an unregistered callback slot.
+pub fn putc_lf0_poll(byte: u8) -> bool {
+    putc_poll(&LF0_BASE, byte)
+}
+
+/// Transmit bytes through LF0 without creating a buffered UART instance.
+///
+/// Returns the number of bytes confirmed by the bounded polling primitive.
+pub fn transmit_lf0_sync(bytes: &[u8]) -> usize {
+    bytes
+        .iter()
+        .take_while(|&&byte| putc_lf0_poll(byte))
+        .count()
+}
+
 // ---------------------------------------------------------------------------
 // DeferredCallClient — deferred TX/RX abort notifications
 // ---------------------------------------------------------------------------
@@ -744,19 +765,12 @@ impl DeferredCallClient for LinFlexD<'_> {
     }
 
     fn handle_deferred_call(&self) {
-        if let TxState::Aborted(rcode) = self.tx_state.get() {
+        if let TxState::Aborted(result, confirmed) = self.tx_state.get() {
             self.tx_state.set(TxState::Idle);
             self.tx_client.map(|client| {
-                if self
-                    .tx_buffer
-                    .take()
-                    .map(|buf| {
-                        client.transmitted_buffer(buf, self.tx_len.get(), rcode);
-                    })
-                    .is_none()
-                {
-                    client.transmitted_word(rcode);
-                }
+                self.tx_buffer.take().map(|buffer| {
+                    client.transmitted_buffer(buffer, confirmed, result);
+                });
             });
         }
 
@@ -776,24 +790,19 @@ impl DeferredCallClient for LinFlexD<'_> {
 // ---------------------------------------------------------------------------
 
 impl Configure for LinFlexD<'_> {
-    /// Configure the LINFlexD for UART operation with the specified parameters.
-    /// Note that we only support a subset of possible configurations for now:
-    /// - 8 data bits
-    /// - No parity
-    /// - 1 stop bit
-    /// - No hardware flow control
-    /// - Baud rates of 115200 and 921600 (at 48 MHz FIRC)
+    /// Configure the LINFlexD for asynchronous 8N1 buffered UART operation.
+    ///
+    /// No parity, alternate stop-bit, wider-word, DMA, or hardware-flow-control
+    /// configuration is supported.
     ///
     /// # INIT-ONLY
     /// Contains hardware spin-waits bounded by `HW_POLL_MAX` (WCET ≈ 40 ms at
-    /// 48 MHz FIRC — the hardware protocol requires polling LINSR[LINS] until
+    /// 48 MHz FIRC — the hardware protocol polls `LINSR[LINS]` until
     /// INIT mode is acknowledged before any register can be written).
     /// **Must only be called during board initialisation, before `kernel_loop()`.**
     /// Runtime reconfiguration is prohibited — see safety manual §UART-INIT.
     fn configure(&self, params: kernel::hil::uart::Parameters) -> Result<(), ErrorCode> {
         let regs = self.registers;
-
-        // We only support 8N1 with no flow control for now, which covers the common use cases for console output.
         match (
             params.width,
             params.parity,
@@ -830,29 +839,12 @@ impl Configure for LinFlexD<'_> {
         );
 
         // --- Step 4: Baud rate divisors (INIT-mode only) ----------------------
-        // RM §49.4.2.14:
-        //   baud = LIN_CLK / (16 × LDIV)
-        //   LDIV = IBR + FBR/16
-        //
-        // Solve in 16ths to avoid floats:
-        //   ldiv16 = 16 × LDIV = round(clk_hz / baud)
-        //   IBR    = ldiv16 / 16   (truncate)
-        //   FBR    = ldiv16 % 16
-        // FBR is 4 bits (0..15); IBR is 20 bits (1..0xFFFFF).
-        let clk_hz = self.input_clock_hz.get();
-        let baud = params.baud_rate;
-        if baud == 0 || clk_hz == 0 {
-            return Err(ErrorCode::INVAL);
-        }
-        let ldiv16 = (clk_hz + baud / 2) / baud;
-        let ibr = ldiv16 / 16;
-        let fbr = ldiv16 % 16;
-        if ibr == 0 || ibr > 0xF_FFFF {
-            return Err(ErrorCode::NOSUPPORT);
-        }
-
-        regs.linfbrr.write(LINFBRR::FBR.val(fbr));
-        regs.linibrr.write(LINIBRR::IBR.val(ibr));
+        // RM §49.4.2.14 encodes LDIV as IBR + FBR/16. Keep this write path
+        // coupled to the pure calculation used by host tests and board docs.
+        let baud = calculate_baud(self.input_clock_hz.get(), params.baud_rate)?;
+        regs.linfbrr
+            .write(LINFBRR::FBR.val(baud.fractional_divisor));
+        regs.linibrr.write(LINIBRR::IBR.val(baud.integer_divisor));
 
         // --- Step 5: GCR — 1 stop bit, LSB-first, no inversion, soft-reset off -
         regs.gcr.write(GCR::SR::CLEAR + GCR::STOP::CLEAR);
@@ -862,16 +854,11 @@ impl Configure for LinFlexD<'_> {
         // 0x80 ≈ 128 baud periods ≈ 1.1 ms at 115200.
         regs.uartpto.write(UARTPTO::PTO.val(0x80));
 
-        // --- Step 7: Word length, parity, stop bits ---------------------------
+        // --- Step 7: 8N1 word format -----------------------------------------
         // RM §49.5.6 / §49.4.4:
-        //   Width:  WL1=0 WL0=1 → 8 bits  (default)
-        //   Parity: PCE=0 → no parity   (default)
-        //   Stop:   GCR[STOP]=0 + SBUR=0 → 1 stop bit (default)
-        //
-        // TODO: support 9-bit, 16-bit, 17-bit word lengths when params.width is
-        //       Width::Six or Width::Seven (maps to 8N1 still).
-        // TODO: support 2 stop bits via SBUR when params.stop_bits == StopBits::Two.
-
+        //   Width:  WL1=0 WL0=1 → 8 bits
+        //   Parity: PCE=0 → no parity
+        //   Stop:   GCR[STOP]=0 + SBUR=0 → 1 stop bit
         regs.uartcr
             .modify(UARTCR::WL1::CLEAR + UARTCR::WL0::SET + UARTCR::PCE::CLEAR);
 
@@ -929,47 +916,41 @@ impl<'a> Transmit<'a> for LinFlexD<'a> {
         if tx_len == 0 || tx_len > tx_data.len() {
             return Err((ErrorCode::SIZE, tx_data));
         }
-        if self.is_transmitting() {
+        if self.tx_state.get() != TxState::Idle {
             return Err((ErrorCode::BUSY, tx_data));
         }
+
+        let regs = self.registers;
+        self.disable_tx_interrupt();
+        regs.uartsr.write(UARTSR::DTFTFF::SET);
         self.tx_buffer.replace(tx_data);
         self.tx_len.set(tx_len);
-        self.tx_index.set(0);
+        self.tx_queued.set(0);
+        self.tx_confirmed.set(0);
         self.tx_state.set(TxState::Transmitting);
-
-        // Enable transmitter and kick off the first batch.
-        let regs = self.registers;
         regs.uartcr.modify(UARTCR::TxEn::SET);
-
-        // Arm the TX completion interrupt.
-        regs.linier.modify(LINIER::DTIE::SET);
         self.tx_progress();
+        regs.linier.modify(LINIER::DTIE::SET);
 
         Ok(())
     }
 
-    fn transmit_word(&self, word: u32) -> Result<(), ErrorCode> {
-        if self.is_transmitting() {
-            return Err(ErrorCode::BUSY);
-        }
-        // ensure we send only one word
-        self.tx_len.set(0);
-        self.tx_index.set(0);
-        let regs = self.registers;
-        regs.uartcr.modify(UARTCR::TxEn::SET);
-        // Arm the TX completion interrupt.
-        regs.linier.modify(LINIER::DTIE::SET);
-        regs.bdrl.write(BDRL::DATA0.val(word));
-        self.tx_state.set(TxState::Transmitting);
-        Ok(())
+    fn transmit_word(&self, _word: u32) -> Result<(), ErrorCode> {
+        Err(ErrorCode::NOSUPPORT)
     }
 
     fn transmit_abort(&self) -> Result<(), ErrorCode> {
-        if self.tx_state.get() != TxState::Transmitting {
+        if self.tx_state.get() == TxState::Idle {
             return Ok(());
         }
+        if matches!(self.tx_state.get(), TxState::Aborted(_, _)) {
+            return Err(ErrorCode::BUSY);
+        }
         self.disable_tx_interrupt();
-        self.tx_state.set(TxState::Aborted(Err(ErrorCode::CANCEL)));
+        self.tx_state.set(TxState::Aborted(
+            Err(ErrorCode::CANCEL),
+            self.tx_confirmed.get(),
+        ));
         self.deferred_call.set();
         Err(ErrorCode::BUSY)
     }
@@ -989,40 +970,43 @@ impl<'a> Receive<'a> for LinFlexD<'a> {
         rx_buffer: &'static mut [u8],
         rx_len: usize,
     ) -> Result<(), (ErrorCode, &'static mut [u8])> {
-        if rx_len == 0 || rx_len > rx_buffer.len() || rx_len > 4 {
+        if rx_len == 0 || rx_len > rx_buffer.len() {
             return Err((ErrorCode::SIZE, rx_buffer));
         }
-        if self.rx_state.get() == RxState::Receiving {
+        if self.rx_state.get() != RxState::Idle {
             return Err((ErrorCode::BUSY, rx_buffer));
         }
+
+        let regs = self.registers;
+        self.disable_rx_interrupt();
+        regs.uartsr.write(
+            UARTSR::RMB::SET
+                + UARTSR::DRFRFE::SET
+                + UARTSR::TO::SET
+                + UARTSR::BOF::SET
+                + UARTSR::FEF::SET
+                + UARTSR::PE.val(0xF)
+                + UARTSR::SZF::SET
+                + UARTSR::NF::SET,
+        );
 
         self.rx_buffer.replace(rx_buffer);
         self.rx_len.set(rx_len);
         self.rx_index.set(0);
         self.rx_state.set(RxState::Receiving);
-
-        // Configure RDFL to match requested byte count (max 4 in buffer mode).
-        // TODO: for >4 bytes chain multiple receive_buffer calls or use FIFO mode.
-        let rdfl = rx_len as u32 - 1;
-        let regs = self.registers;
-
-        // Update TDFL/RDFL while in Normal mode (allowed per RM §49.5.6).
-        regs.uartcr.modify(UARTCR::RDFL.val(rdfl));
-
-        // Clear stale flags and enable receiver.
-        regs.uartsr
-            .write(UARTSR::RMB::SET + UARTSR::DRFRFE::SET + UARTSR::TO::SET);
         regs.uartcr.modify(UARTCR::RxEn::SET);
-
-        // Arm RX completion and timeout interrupts.
-        regs.linier
-            .modify(LINIER::DRIE::SET + LINIER::TOIE::SET + LINIER::BOIE::SET);
+        regs.linier.modify(
+            LINIER::DRIE::SET
+                + LINIER::TOIE::CLEAR
+                + LINIER::BOIE::SET
+                + LINIER::FEIE::SET
+                + LINIER::SZIE::SET,
+        );
 
         Ok(())
     }
 
     fn receive_word(&self) -> Result<(), ErrorCode> {
-        // TODO: implement word receive state machine
         Err(ErrorCode::NOSUPPORT)
     }
 
@@ -1120,36 +1104,39 @@ macro_rules! trace_sync {
     };
 }
 
-/// Extract the UART receive bytes from the BDRM register word.
+fn receive_error(
+    status: kernel::utilities::registers::LocalRegisterCopy<u32, UARTSR::Register>,
+) -> Option<uart::Error> {
+    if status.is_set(UARTSR::SZF) {
+        Some(uart::Error::BreakError)
+    } else if status.is_set(UARTSR::BOF) {
+        Some(uart::Error::OverrunError)
+    } else if status.is_set(UARTSR::FEF) {
+        Some(uart::Error::FramingError)
+    } else if status.read(UARTSR::PE) != 0 {
+        Some(uart::Error::ParityError)
+    } else if status.is_set(UARTSR::NF) {
+        Some(uart::Error::None)
+    } else {
+        None
+    }
+}
+
+/// Extract the one-byte UART buffer value from BDRM.
 ///
-/// In UART **buffer** mode the receive buffer is the 4-byte BDRM register:
-/// RM §49.4.4.7 Table 331 lists "Read Byte4-5-6-7 / BUFFER → OK" as the only
-/// valid receive reads, i.e. received bytes 0..3 map to BDRM DATA4..DATA7
-/// (BDR4..BDR7). BDRL is the transmit buffer here (`putc`/`tx_progress` write
-/// BDRL::DATA0), so it must NOT be used on the RX path — reading it back
-/// returns stale TX data.
-///
-/// `bdrm` is the raw BDRM word; bytes are little-endian (DATA4 = bits 0..7).
-/// Returns the number of bytes written (`dst.len()`, capped at the 4-byte
-/// buffer; callers reject `rx_len > 4` in `receive_buffer`).
+/// In buffer mode, LINFlexD stores the received byte in BDRM DATA4; this is
+/// the NXP `Linflexd_Uart_Ip_GetRxDataBuffer1Byte()` convention. `BDRL` DATA0
+/// is the transmit data field and must not be used for UART receive.
 #[inline]
-fn read_rx_bytes(bdrm: u32, dst: &mut [u8]) -> usize {
-    let bytes: [u8; 4] = [
-        bdrm as u8,
-        (bdrm >> 8) as u8,
-        (bdrm >> 16) as u8,
-        (bdrm >> 24) as u8,
-    ];
-    let n = dst.len().min(4);
-    dst[..n].copy_from_slice(&bytes[..n]);
-    n
+fn read_rx_byte(bdrm: u32) -> u8 {
+    bdrm as u8
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use kernel::deferred_call::initialize_deferred_call_state;
-    use kernel::hil::uart::Receive;
+    use kernel::hil::uart::{Receive, Transmit};
     use kernel::platform::chip::ThreadIdProvider;
     enum TestThread {}
     unsafe impl ThreadIdProvider for TestThread {
@@ -1157,62 +1144,220 @@ mod tests {
             0
         }
     }
-    /// Single received byte lands in BDRM::DATA4 (bits 0–7) → dst[0].
+
     #[test]
-    fn rx_single_byte_from_bdrm_data4() {
-        let mut buf = [0u8; 1];
-        let bdrm = 0x0000_0042; // DATA4 = 0x42
-        let n = read_rx_bytes(bdrm, &mut buf);
-        assert_eq!(n, 1);
-        assert_eq!(buf[0], 0x42);
+    fn baud_calculation_40mhz_lf0_115200_is_within_one_percent() {
+        let baud = calculate_baud(40_000_000, 115_200).unwrap();
+
+        assert_eq!(baud.integer_divisor, 21);
+        assert_eq!(baud.fractional_divisor, 11);
+        assert_eq!(baud.actual_baud, 115_273);
+        assert_eq!(baud.error_hz, 73);
+        assert!(baud.error_hz < 115_200 / 100);
     }
-    /// Four received bytes map to BDRM::DATA4..DATA7 (little-endian).
+
     #[test]
-    fn rx_four_bytes_from_bdrm() {
-        let mut buf = [0u8; 4];
-        let bdrm = 0x0706_0504; // DATA7=0x07, DATA6=0x06, DATA5=0x05, DATA4=0x04
-        let n = read_rx_bytes(bdrm, &mut buf);
-        assert_eq!(n, 4);
-        assert_eq!(buf, [0x04, 0x05, 0x06, 0x07]);
+    fn baud_calculation_40mhz_lf1_921600_is_within_one_percent() {
+        let baud = calculate_baud(40_000_000, 921_600).unwrap();
+
+        assert_eq!(baud.integer_divisor, 2);
+        assert_eq!(baud.fractional_divisor, 11);
+        assert_eq!(baud.actual_baud, 930_232);
+        assert_eq!(baud.error_hz, 8_632);
+        assert!(baud.error_hz < 921_600 / 100);
     }
-    /// A short destination caps the read at dst.len().
+
     #[test]
-    fn rx_capped_by_dst_len() {
-        let mut buf = [0u8; 3];
-        let bdrm = 0x0706_0504;
-        let n = read_rx_bytes(bdrm, &mut buf);
-        assert_eq!(n, 3);
-        assert_eq!(buf, [0x04, 0x05, 0x06]);
+    fn configure_rejects_non_8n1_or_flow_control_without_touching_hardware() {
+        initialize_deferred_call_state::<TestThread>();
+        let unsupported = [
+            kernel::hil::uart::Parameters {
+                baud_rate: 115_200,
+                width: Width::Seven,
+                parity: Parity::None,
+                stop_bits: StopBits::One,
+                hw_flow_control: false,
+            },
+            kernel::hil::uart::Parameters {
+                baud_rate: 115_200,
+                width: Width::Eight,
+                parity: Parity::Odd,
+                stop_bits: StopBits::One,
+                hw_flow_control: false,
+            },
+            kernel::hil::uart::Parameters {
+                baud_rate: 115_200,
+                width: Width::Eight,
+                parity: Parity::None,
+                stop_bits: StopBits::Two,
+                hw_flow_control: false,
+            },
+            kernel::hil::uart::Parameters {
+                baud_rate: 115_200,
+                width: Width::Eight,
+                parity: Parity::None,
+                stop_bits: StopBits::One,
+                hw_flow_control: true,
+            },
+        ];
+
+        for params in unsupported {
+            let mut backing = [0u32; 24];
+            let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
+            let uart = LinFlexD::new(regs);
+
+            assert_eq!(uart.configure(params), Err(ErrorCode::NOSUPPORT));
+            assert_eq!(backing, [0; 24]);
+        }
     }
-    /// The 4-byte UART buffer never yields more than 4 bytes even if the
-    /// destination is larger.
+
     #[test]
-    fn rx_caps_at_four_bytes() {
-        let mut buf = [0xFFu8; 6];
-        let bdrm = 0x0706_0504;
-        let n = read_rx_bytes(bdrm, &mut buf);
-        assert_eq!(n, 4);
-        assert_eq!(&buf[..4], &[0x04, 0x05, 0x06, 0x07]);
-        // Tail untouched.
-        assert_eq!(&buf[4..], &[0xFF, 0xFF]);
-    }
-    /// receive_buffer must reject rx_len > 4 with ErrorCode::SIZE rather than
-    /// silently wrapping RDFL.
-    #[test]
-    fn receive_buffer_rejects_five_bytes() {
+    fn transmit_abort_reports_only_confirmed_bytes() {
         initialize_deferred_call_state::<TestThread>();
         let mut backing = [0u32; 24];
         let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
-        let lf = LinFlexD::new(regs);
-        static mut BUF: [u8; 8] = [0; 8];
+        let uart = LinFlexD::new(regs);
+        uart.tx_len.set(3);
+        uart.tx_queued.set(2);
+        uart.tx_confirmed.set(1);
+        uart.tx_state.set(TxState::Transmitting);
+        assert_eq!(uart.transmit_abort(), Err(ErrorCode::BUSY));
+        assert!(matches!(
+            uart.tx_state.get(),
+            TxState::Aborted(Err(ErrorCode::CANCEL), 1),
+        ));
+    }
+
+    #[test]
+    fn transmit_word_is_unsupported_without_state_change() {
+        initialize_deferred_call_state::<TestThread>();
+        let mut backing = [0u32; 24];
+        let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
+        let uart = LinFlexD::new(regs);
+        assert_eq!(uart.transmit_word(0xABCD), Err(ErrorCode::NOSUPPORT));
+        assert!(matches!(uart.tx_state.get(), TxState::Idle));
+        assert_eq!(backing, [0; 24]);
+    }
+
+    #[test]
+    fn transmit_restart_is_blocked_while_abort_callback_is_pending() {
+        initialize_deferred_call_state::<TestThread>();
+        let mut backing = [0u32; 24];
+        let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
+        let uart = LinFlexD::new(regs);
+        uart.tx_state
+            .set(TxState::Aborted(Err(ErrorCode::CANCEL), 0));
+        static mut BUFFER: [u8; 1] = [0; 1];
         #[allow(static_mut_refs)]
-        let buf = unsafe {
-            &mut BUF
-        };
-        let result = lf.receive_buffer(buf, 5);
-        assert!(result.is_err());
-        let (ecode, returned) = result.unwrap_err();
-        assert_eq!(ecode, ErrorCode::SIZE);
-        assert_eq!(returned.len(), 8);
+        let buffer = unsafe { &mut BUFFER };
+        let (error, _) = uart.transmit_buffer(buffer, 1).unwrap_err();
+        assert_eq!(error, ErrorCode::BUSY);
+    }
+    #[test]
+    fn receive_buffer_rejects_restart_while_abort_callback_is_pending() {
+        initialize_deferred_call_state::<TestThread>();
+        let mut backing = [0u32; 24];
+        let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
+        let uart = LinFlexD::new(regs);
+        uart.rx_state.set(RxState::Aborted(
+            Err(ErrorCode::CANCEL),
+            uart::Error::Aborted,
+        ));
+        static mut BUFFER: [u8; 1] = [0; 1];
+        #[allow(static_mut_refs)]
+        let buffer = unsafe { &mut BUFFER };
+        let (error, _) = uart.receive_buffer(buffer, 1).unwrap_err();
+        assert_eq!(error, ErrorCode::BUSY);
+    }
+
+    #[test]
+    fn polling_putc_writes_registers_without_deferred_call_state() {
+        // Do not initialize the deferred-call subsystem: early boot invokes this
+        // primitive before any LinFlexD instance can register a callback.
+        let mut backing = [0u32; 24];
+        backing[5] = UARTSR::DTFTFF::SET.value;
+        let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
+
+        assert!(putc_poll(&regs, 0xA5));
+        assert_eq!(backing[14], 0xA5);
+        assert_eq!(
+            backing[5] & UARTSR::DTFTFF::SET.value,
+            UARTSR::DTFTFF::SET.value
+        );
+    }
+    #[test]
+    fn rx_byte_uses_bdrm_data4() {
+        assert_eq!(read_rx_byte(0xA5A5_5A42), 0x42);
+    }
+
+    #[test]
+    fn receive_error_mapping_prioritizes_stuck_zero() {
+        let status = kernel::utilities::registers::LocalRegisterCopy::new(
+            UARTSR::SZF::SET.value | UARTSR::BOF::SET.value | UARTSR::FEF::SET.value,
+        );
+        assert_eq!(receive_error(status), Some(uart::Error::BreakError));
+    }
+
+    #[test]
+    fn receive_error_mapping_covers_each_receive_fault() {
+        let cases = [
+            (UARTSR::BOF::SET.value, uart::Error::OverrunError),
+            (UARTSR::FEF::SET.value, uart::Error::FramingError),
+            (UARTSR::PE.val(1).value, uart::Error::ParityError),
+            (UARTSR::NF::SET.value, uart::Error::None),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(
+                receive_error(kernel::utilities::registers::LocalRegisterCopy::new(status)),
+                Some(expected),
+            );
+        }
+    }
+
+    fn receive_buffer_of_len(len: usize) -> Result<(), ErrorCode> {
+        initialize_deferred_call_state::<TestThread>();
+        let mut backing = [0u32; 24];
+        let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
+        let uart = LinFlexD::new(regs);
+        static mut BUFFER: [u8; 16] = [0; 16];
+        #[allow(static_mut_refs)]
+        let buffer = unsafe { &mut BUFFER };
+        uart.receive_buffer(buffer, len).map_err(|(error, _)| error)
+    }
+
+    #[test]
+    fn receive_buffer_accepts_arbitrary_buffer_lengths() {
+        for length in [1, 4, 5, 16] {
+            assert_eq!(receive_buffer_of_len(length), Ok(()));
+        }
+    }
+
+    #[test]
+    fn receive_buffer_rejects_zero_and_oversized_lengths() {
+        initialize_deferred_call_state::<TestThread>();
+        let mut backing = [0u32; 24];
+        let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
+        let uart = LinFlexD::new(regs);
+        static mut BUFFER: [u8; 4] = [0; 4];
+        #[allow(static_mut_refs)]
+        let buffer = unsafe { &mut BUFFER };
+        let (error, _) = uart.receive_buffer(buffer, 0).unwrap_err();
+        assert_eq!(error, ErrorCode::SIZE);
+    }
+
+    #[test]
+    fn receive_buffer_preserves_init_mode_rdfl_and_disables_timeout() {
+        initialize_deferred_call_state::<TestThread>();
+        let mut backing = [0u32; 24];
+        backing[4] = 0b111 << 10;
+        let regs = unsafe { StaticRef::new(backing.as_mut_ptr() as *const LinFlexDRegisters) };
+        let uart = LinFlexD::new(regs);
+        static mut BUFFER: [u8; 1] = [0; 1];
+        #[allow(static_mut_refs)]
+        let buffer = unsafe { &mut BUFFER };
+        assert_eq!(uart.receive_buffer(buffer, 1), Ok(()));
+        assert_eq!(backing[4] & (0b111 << 10), 0b111 << 10);
+        assert_ne!(backing[1] & (1 << 2), 0);
+        assert_eq!(backing[1] & (1 << 3), 0);
     }
 }

@@ -118,6 +118,38 @@ pub struct Clocks {
     mc_cgm6: McCgm,
 }
 
+/// Fixed CM7_0 core clock after [`Clocks::setup_m7_clocks`].
+///
+/// The retained CORE_DFS1 configuration yields `2_600_000_000 * 18 / 59` Hz
+/// for XBAR_2X_CLK; CM7_0 receives XBAR_2X_CLK / 2 (RM §24.3, §24.7).
+pub const M7_CORE_FREQUENCY_HZ: u32 = 396_610_169;
+
+/// Hardware domains touched by the SAIL board's clock initializer.
+///
+/// This declarative list makes the board-level M7-only dependency closure
+/// auditable without duplicating the MMIO sequence in tests.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum M7ClockAction {
+    Fxosc,
+    CorePll,
+    CoreDfs,
+    Xbar,
+    PeriphPll,
+    Stm,
+    LinBaud,
+}
+
+/// Clock domains configured by [`Clocks::setup_m7_clocks`].
+pub const M7_CLOCK_ACTIONS: &[M7ClockAction] = &[
+    M7ClockAction::Fxosc,
+    M7ClockAction::CorePll,
+    M7ClockAction::CoreDfs,
+    M7ClockAction::Xbar,
+    M7ClockAction::PeriphPll,
+    M7ClockAction::Stm,
+    M7ClockAction::LinBaud,
+];
+
 // ---------------------------------------------------------------------------
 // Private constants: eliminate magic numbers for mux indices and PHI outputs
 // ---------------------------------------------------------------------------
@@ -139,9 +171,6 @@ const PHI0: usize = 0;
 const PHI1: usize = 1;
 const PHI2: usize = 2;
 const PHI3: usize = 3;
-const PHI4: usize = 4;
-const PHI5: usize = 5;
-const PHI6: usize = 6;
 const PHI7: usize = 7;
 
 impl Clocks {
@@ -471,46 +500,35 @@ impl Clocks {
     /// # Errors
     ///
     /// Returns the first error encountered during initialization.
-    pub fn setup_production_clocks(&self) -> Result<(), ErrorCode> {
-        // Reference clock: FXOSC at 40 MHz (SAIL board crystal)
+    /// Configure only the SAIL board's active M7 clock dependency closure.
+    ///
+    /// The M7 path needs FXOSC, CORE_PLL/CORE_DFS1 for XBAR and CM7_0, and
+    /// PERIPH_PLL PHI3 for LINFlexD. CA53 remains in reset; its clock mux and
+    /// the DDR and accelerator PLL domains are deliberately not touched.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first error encountered during initialization.
+    pub fn setup_m7_clocks(&self) -> Result<(), ErrorCode> {
         const FXOSC_FREQ_MHZ: u32 = 40;
-        const FXOSC_FREQ_HZ: u32 = FXOSC_FREQ_MHZ * 1_000_000;
+        const FXOSC_FREQ_HZ: u32 = 40_000_000;
 
-        // --- Safe-Clock Parking ----------------------------------------------
-        // Park A53_CORE_CLK (MC_CGM_1 Mux 0) and XBAR_2X_CLK (MC_CGM_0 Mux 0)
-        // on the safe FIRC clock so we can safely reprogram CORE_PLL and CORE_DFS
-        // without glitching or deadlocking the running A53 core!
-        self.mc_cgm1
-            .set_mux_source(MUX_A53_CORE_CLK, CgmClockSource::Firc)?;
         self.mc_cgm0
             .set_mux_source(MUX_XBAR_2X_CLK, CgmClockSource::Firc)?;
+        self.mc_cgm0
+            .set_mux_source(MUX_LIN_BAUD_CLK, CgmClockSource::Firc)?;
 
-        // --- Step 1: Enable FXOSC -------------------------------------------
-        self.fxosc.set_frequency_mhz(FXOSC_FREQ_MHZ);
+        self.fxosc.set_frequency_mhz(FXOSC_FREQ_MHZ)?;
         self.fxosc.enable_crystal()?;
-        // --- Step 2: Configure PLLs -----------------------------------------
-        // Disabling CORE_PLL clears its lock bit, forcing Tock to actively
-        // reprogram it to the target 2.6 GHz instead of skipping it.
+
         self.core_pll.disable_pll()?;
         self.core_pll.select_reference_fxosc()?;
         self.core_pll.configure(
             FXOSC_FREQ_HZ,
-            PllConfig::from_frequencies(FXOSC_FREQ_HZ, 2600000000, 1),
+            PllConfig::from_frequencies(FXOSC_FREQ_HZ, 2_600_000_000, 1)?,
         )?;
-        // PHI0 = 2600 / (1+1) = 1300 MHz → A53_CORE_CLK
-        self.core_pll.configure_phi(PhiConfig {
-            index: PHI0,
-            div: 1,
-            enabled: true,
-        })?;
-        // PHI1 = 2600 / (9+1) = 260 MHz (reserved; not consumed by A53)
-        self.core_pll.configure_phi(PhiConfig {
-            index: PHI1,
-            div: 9,
-            enabled: true,
-        })?;
 
-        // PERIPH_PLL: VCO = 40 MHz / 1 × 50 = 2000 MHz
+        self.periph_pll.disable_pll()?;
         self.periph_pll.select_reference_fxosc()?;
         self.periph_pll.configure(
             FXOSC_FREQ_HZ,
@@ -520,172 +538,68 @@ impl Clocks {
                 mfn: 0,
             },
         )?;
-        // PHI0 = 2000 / (19+1) = 100 MHz → CLKOUT
-        self.periph_pll.configure_phi(PhiConfig {
-            index: PHI0,
-            div: 19,
-            enabled: true,
-        })?;
-        // PHI1 = 2000 / (19+1) = 100 MHz → PER_CLK
-        self.periph_pll.configure_phi(PhiConfig {
-            index: PHI1,
-            div: 19,
-            enabled: true,
-        })?;
-        // PHI2 = 2000 / (23+1) ≈ 83 MHz → CAN_PE_CLK
-        self.periph_pll.configure_phi(PhiConfig {
-            index: PHI2,
-            div: 23,
-            enabled: true,
-        })?;
-        // PHI3 = 2000 / (49+1) = 40 MHz → LIN_BAUD_CLK
         self.periph_pll.configure_phi(PhiConfig {
             index: PHI3,
             div: 49,
             enabled: true,
         })?;
-        // PHI4 = 2000 / (15+1) = 125 MHz → GMAC_TS_CLK
-        self.periph_pll.configure_phi(PhiConfig {
-            index: PHI4,
-            div: 15,
-            enabled: true,
-        })?;
-        // PHI5 = 2000 / (15+1) = 125 MHz → GMAC/PFE TX
-        self.periph_pll.configure_phi(PhiConfig {
-            index: PHI5,
-            div: 15,
-            enabled: true,
-        })?;
-        // PHI6 = 2000 / (7+1) = 250 MHz
-        self.periph_pll.configure_phi(PhiConfig {
-            index: PHI6,
-            div: 7,
-            enabled: true,
-        })?;
-        // PHI7 = 2000 / (19+1) = 100 MHz → SPI_CLK
-        self.periph_pll.configure_phi(PhiConfig {
-            index: PHI7,
-            div: 19,
-            enabled: true,
-        })?;
-        // DDR_PLL: VCO = 40 MHz / 1 × 40 = 1600 MHz
-        self.ddr_pll.select_reference_fxosc()?;
-        self.ddr_pll.configure(
-            FXOSC_FREQ_HZ,
-            PllConfig {
-                rdiv: 1,
-                mfi: 40,
-                mfn: 0,
-            },
-        )?;
-        // PHI0 = 1600 / (1+1) = 800 MHz → DDR_CLK
-        self.ddr_pll.configure_phi(PhiConfig {
-            index: PHI0,
-            div: 1,
-            enabled: true,
-        })?;
 
-        // ACCEL_PLL: VCO = 40 MHz / 1 × 50 = 2000 MHz
-        self.accel_pll.select_reference_fxosc()?;
-        self.accel_pll.configure(
-            FXOSC_FREQ_HZ,
-            PllConfig {
-                rdiv: 1,
-                mfi: 50,
-                mfn: 0,
-            },
-        )?;
-        // PHI0 = 2000 / (3+1) = 500 MHz
-        self.accel_pll.configure_phi(PhiConfig {
-            index: PHI0,
-            div: 3,
-            enabled: true,
-        })?;
-        // PHI1 = 2000 / (7+1) = 250 MHz → PFE_PE_CLK
-        self.accel_pll.configure_phi(PhiConfig {
-            index: PHI1,
-            div: 7,
-            enabled: true,
-        })?;
+        if !self.core_pll.is_locked() {
+            self.core_pll.enable_pll()?;
+        }
+        if !self.periph_pll.is_locked() {
+            self.periph_pll.enable_pll()?;
+        }
 
-        // --- Step 3: Enable PLLs in order (RM §24.5.3) ----------------------
-        self.enable_all_plls()?;
-
-        // --- Step 4: Enable DFS blocks and configure ports ------------------
-        // We first force-disable the CORE_DFS block to clear port locks,
-        // making sure configure_port actively programs the divider instead of skipping it.
         self.core_dfs.disable_dfs();
         self.core_dfs.enable_dfs();
-        // Delay to allow the DFS block to exit reset and stabilize before configuring
-        for _ in 0..10000 {
+        for _ in 0..10_000 {
             core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         }
-        self.enable_dfs_blocks()?;
-        // CORE_DFS port 0 → CORE_DFS1_CLK → XBAR_2X_CLK (MC_CGM_0 mux 0).
-        //
-        // If a prior boot stage (e.g. the A53 boot ROM or secondary loader)
-        // has already configured this DFS port and is actively fetching
-        // instructions through XBAR_2X_CLK, reprogramming the port would
-        // deadlock that core.  We therefore program the exact MFI/MFN that
-        // matches the typical prior-stage configuration (MFI=1, MFN=23),
-        // which makes the `init_dfs_port()` logic in the other stage see
-        // live registers that already match its target and skip the reset.
-        //
-        // Target XBAR_2X ≈ 793 MHz
-        // (f = 2600·18/(1·36+23) ≈ 793.2 MHz).
-        // Adjust this if your board uses a different prior-stage divider.
+        self.core_dfs
+            .set_vco_frequency_hz(self.core_pll.get_vco_frequency_hz());
+        self.core_dfs.enable_dfs();
         self.core_dfs.configure_port(DfsPortConfig {
             port: DfsPort::Port0,
             mfi: 1,
             mfn: 23,
         })?;
 
-        // PERIPH_DFS port 0: f = 2000 / (2 × (3 + 0/36)) ≈ 333 MHz
-        // → PERIPH_DFS1_CLK → QSPI_2X_CLK (MC_CGM_0 mux 12)
-        self.periph_dfs.configure_port(DfsPortConfig {
-            port: DfsPort::Port0,
-            mfi: 3,
-            mfn: 0,
-        })?;
-
-        // PERIPH_DFS port 2: f = 2000 / (2 × (3 + 0/36)) ≈ 333 MHz
-        // → PERIPH_DFS3_CLK → USDHC_CLK (MC_CGM_0 mux 14)
-        self.periph_dfs.configure_port(DfsPortConfig {
-            port: DfsPort::Port2,
-            mfi: 3,
-            mfn: 0,
-        })?;
-
-        // PERIPH_DFS port 4: f = 2000 / (2 × (5 + 0/36)) = 200 MHz
-        // → PERIPH_DFS5_CLK → CLKOUT (MC_CGM_0 mux 1/2)
-        self.periph_dfs.configure_port(DfsPortConfig {
-            port: DfsPort::Port4,
-            mfi: 5,
-            mfn: 0,
-        })?;
-
-        // --- Step 5: Switch MC_CGM muxes to production sources -------------
         self.mc_cgm0
             .set_mux_source(MUX_XBAR_2X_CLK, CgmClockSource::CoreDfs1)?;
         self.mc_cgm0
-            .set_mux_source(MUX_PER_CLK, CgmClockSource::PeriphPllPhi1)?;
-        self.mc_cgm0
-            .set_mux_source(MUX_CAN_PE_CLK, CgmClockSource::PeriphPllPhi2)?;
-        self.mc_cgm0
             .set_mux_source(MUX_LIN_BAUD_CLK, CgmClockSource::PeriphPllPhi3)?;
-        self.mc_cgm0
-            .set_mux_source(MUX_QSPI_2X_CLK, CgmClockSource::PeriphDfs1)?;
-        self.mc_cgm0
-            .set_mux_source(MUX_USDHC_CLK, CgmClockSource::PeriphDfs3)?;
-        self.mc_cgm0
-            .set_mux_source(MUX_SPI_CLK, CgmClockSource::PeriphPllPhi7)?;
-        self.mc_cgm1
-            // The A53 clock infrastructure must be programmed before releasing
-            // CA53 from reset, otherwise the core has no clock.
-            .set_mux_source(MUX_A53_CORE_CLK, CgmClockSource::CorePllPhi0)?;
-        self.mc_cgm5
-            .set_mux_source(MUX_DDR_CLK, CgmClockSource::DdrPllPhi0)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn m7_setup_actions_are_exactly_the_retained_dependency_closure() {
+        assert_eq!(
+            M7_CLOCK_ACTIONS,
+            &[
+                M7ClockAction::Fxosc,
+                M7ClockAction::CorePll,
+                M7ClockAction::CoreDfs,
+                M7ClockAction::Xbar,
+                M7ClockAction::PeriphPll,
+                M7ClockAction::Stm,
+                M7ClockAction::LinBaud,
+            ]
+        );
+    }
+
+    #[test]
+    fn m7_systick_calibration_matches_retained_core_clock() {
+        assert_eq!(M7_CORE_FREQUENCY_HZ, 396_610_169);
+        assert_eq!(
+            u64::from(M7_CORE_FREQUENCY_HZ) * 2,
+            2_600_000_000u64 * 18 / 59
+        );
     }
 }

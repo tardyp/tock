@@ -1,38 +1,60 @@
 NXP S32G3 SAIL Tock board
 =========================
 
-S32G3 is a SoC by NXP targetting automotive and industrial applications. It has a quad-core Cortex-M7 subsystem, and eight-core A53 subsystem.
-The SAIL (Safety Island) is a separate subsystem that is designed to run safety-critical code, tock being a perfect candidate for such applications.
+This board runs Tock on Main SoC S32G3 M7_0. It is a bring-up target for a
+safety-island kernel, not a complete platform definition.
 
-Hardware can be acquired through NXP sales.
+## Build, image layout, and deployment
 
-This board target is the minimal setup for running Tock on the M7_0 core of an S32G3 Safety Island.
-It is intended to be used as a starting point for building a Tock-based application on the S32G3 SoC.
+From the Tock repository root, build the normal kernel with:
 
-It is intentionally limited to the following feature:
-
-- SRAM-linked kernel image at `0x34200000`
-- Large 2MiB SRAM for stack, BSS, and data at `0x34000000`
-- The smaller zero wait state 56KiB DTCM is not used to simplify app deployment.
-
-- Cortex-M7 chip initialization and clock setup
-- uart driver: linflexd
-- timer driver: stm (System Timer Module)
-
-Other more complex drivers are included to the best of our ability, but are not fully tested (see chips/nxp_s32g3/README.md for details).
-
-Build with:
-
-```bash
+```sh
 make -C boards/nxp_s32g3_sail
 ```
 
-You can append to the binary the TBF file of your application, and the resulting binary can be loaded into the S32G3 SRAM.
+The Cargo release binary is `target/thumbv7em-none-eabihf/release/nxp_s32g3_sail.bin`. 
+It is linked and loaded at `0x34200000`.
+The linker reserves `0x34220000..0x3429ffff` for TBF applications. 
+Writable sections start in L2 SRAM at `0x34000000` shared bw kernel and app.
+L2 SRAM is `0x34000000..0x341fffff`. 
+DTCM is deliberately unused: 56 KiB cannot hold the writable image without specializing Tock's default layout.
 
-```
-cat "${KERNEL_BIN}" "${APP_TBF}" > "${COMBINED_BIN}"
+A raw kernel/application image can be constructed as follows:
+
+```sh
+KERNEL_BIN=target/thumbv7em-none-eabihf/release/nxp_s32g3_sail.bin
+APP_TBF=/path/to/application.tbf
+COMBINED_BIN=/path/to/nxp_s32g3_sail-with-app.bin
+cat -- "$KERNEL_BIN" "$APP_TBF" > "$COMBINED_BIN"
+cmp -s -n "$(wc -c < "$KERNEL_BIN")" "$KERNEL_BIN" "$COMBINED_BIN" \
+  && echo "combined image begins with the kernel binary"
 ```
 
-The resulting binary can be loaded into SRAM via a debugger or JTAG probe, or
-flashed into NOR and booted by the SoC boot ROM.  See the NXP S32G3 Reference
-Manual for boot options.
+The normal kernel BIN excludes the `.apps` section; its 128 KiB kernel interval
+places the appended TBF at `0x34220000`. This verifies image construction only.
+
+With secure boot disabled, your can flash the binary directly to NOR.
+The secure boot signing path is documented by NXP and out of scope for the upstream tock support.
+
+## UART topology and manual receive procedure
+
+- LF0 is the debug and process console: TX `PC9` (MSCR41), RX `PC10`, nominal
+  `115200` baud.
+- LF1 is the userspace console: TX `PC8`, RX `PC4`, nominal `921600` baud.
+- LINFlexD implements asynchronous 8N1 buffer HIL only. Word, DMA,
+  wider-word, parity, additional-stop-bit, and flow-control modes are
+  unsupported. Polling output is reserved for panic and early boot.
+
+## Validation matrix
+
+| Area | Status | Evidence / limitation |
+|---|---|---|
+| LINFlexD UART | functional HIL-tested | Manual host tests verify 8N1 and baud; automated test suite verifies LF1 TX plus immediate TX/RX abort contracts. LF1 RX success is unproven. |
+| STM_1 | functional HIL-tested | test suite verifies minimum/10 ms/wrap/disarm plus 100 sequential one-second callbacks; source arithmetic is 516419 Hz and corrected hardware deltas are +3.873 ppm. |
+| M7 clocks | boot-path hardware-exercised |  A53 cooperation is unsupported. |
+| MC_ME / MSCM | boot-path hardware-exercised | Board enables M7 partitions and routes LF0, LF1, and STM1 IRQs. |
+| SIUL2 pinmux | boot-path hardware-exercised | GPIO helpers are preparatory-only; no GPIO HIL or interrupt support. |
+| XRDC_0 policy patching | boot-path hardware-exercised | |
+| XRDC_1 standby-SRAM / SSRAMC | preparatory-only | Policy grant and ECC initialization are retained; no functional consumer is claimed. |
+| Reset and memory layout | boot-path hardware-exercised | |
+| SWT watchdog | boot-path hardware-exercised | Board explicitly leaves hardware watchdog disabled; `DisabledWatchdog` is a no-op, not protection. |

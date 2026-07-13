@@ -74,4 +74,4 @@ pub mod mc_cgm;
 pub mod pll;
 pub mod sirc;
 
-pub use clocks::Clocks;
+pub use clocks::{Clocks, M7_CORE_FREQUENCY_HZ};

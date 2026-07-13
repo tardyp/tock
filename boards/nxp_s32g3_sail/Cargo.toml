@@ -16,7 +16,7 @@ name = "nxp_s32g3_sail"
 path = "src/main.rs"
 [features]
 default = []
-test-harness = []
+test-harness = ["nxp_s32g3/test-harness"]
 
 [dependencies]
 components = { path = "../components" }

@@ -8,9 +8,7 @@
 //! Manual, Chapter 41. The STM provides a 32-bit count-up timer with up to
 //! four compare channels that assert an interrupt when the counter matches a
 //! programmed value. This driver implements the Tock
-//! [`Time`](kernel::hil::time::Time),
-//! [`Counter`](kernel::hil::time::Counter), and
-//! [`Alarm`](kernel::hil::time::Alarm) HIL traits on top of STM channel 0
+//! [`Time`], [`Counter`], and [`Alarm`] HIL traits on top of STM channel 0
 //! (see RM §41.2, §41.4.1, §41.4.2).
 //!
 //! Per RM §41.3.1, the channel registers are spaced 16 bytes apart. Channel 0
@@ -188,20 +186,22 @@ register_bitfields![u32,
     ]
 ];
 
-/// STM effective tick frequency for the S32G3 reference platform.
+/// STM_1 source clock after the retained SAIL M7 clock configuration.
 ///
-/// Derivation (RM §24.7.3, §41.3.2):
-/// - STM module clock source: XBAR_DIV_4 (XBAR_2X_CLK ÷ 4)
-/// - At the reference platform configuration XBAR_DIV_4 ≈ 133.333 MHz
-/// - `Counter::start` programs `CR::CPS = 255`, giving a prescaler of CPS+1 = 256
-/// - Effective frequency: 133_333_333 Hz ÷ 256 ≈ 520_833 Hz
-///
-/// **If `XBAR_2X_CLK` is reconfigured, both this constant and `CR::CPS`
-/// must be updated together.**
-pub struct Freq520KHz;
-impl kernel::hil::time::Frequency for Freq520KHz {
+/// RM §24.7.3 Table 109 assigns STM_1 the XBAR_DIV3_CLK module clock.
+/// CORE_DFS1 configures XBAR_2X_CLK to `2_600_000_000 * 18 / 59` Hz;
+/// XBAR_DIV3_CLK is XBAR_2X_CLK / 6, or 132_203_389 Hz after integer
+/// truncation. RM §41.3.2 defines the effective divider as `CPS + 1`.
+pub const STM_SOURCE_HZ: u32 = 132_203_389;
+pub const STM_CPS: u8 = 255;
+pub const STM_PRESCALER: u32 = STM_CPS as u32 + 1;
+pub const STM_FREQUENCY_HZ: u32 = STM_SOURCE_HZ / STM_PRESCALER;
+
+/// STM effective tick frequency for the S32G3 SAIL board.
+pub struct Freq516KHz;
+impl kernel::hil::time::Frequency for Freq516KHz {
     fn frequency() -> u32 {
-        520_833
+        STM_FREQUENCY_HZ
     }
 }
 
@@ -226,7 +226,7 @@ impl Stm<'_> {
 
     /// STM channel-0 interrupt service routine.
     ///
-    /// Disables the channel, clears the channel interrupt flag (CIR0[CIF] is
+    /// Disables the channel, clears the channel interrupt flag (`CIR0[CIF]` is
     /// write-1-to-clear per RM §41.3.5), and invokes the alarm client. Must
     /// be wired to the channel-0 NVIC vector in the board's chip
     /// configuration.
@@ -240,10 +240,24 @@ impl Stm<'_> {
             client.alarm();
         });
     }
+
+    /// Seed the counter for the hardware-only test harness.
+    ///
+    /// The caller must use this only before arming an STM alarm. The counter
+    /// remains running if it was running on entry.
+    #[cfg(feature = "test-harness")]
+    pub fn seed_counter_for_test(&self, count: u32) {
+        let was_running = self.registers.cr.is_set(CR::TEN);
+        self.registers.cr.modify(CR::TEN::CLEAR);
+        self.registers.cnt.write(CNT::CNT.val(count));
+        if was_running {
+            self.registers.cr.modify(CR::TEN::SET);
+        }
+    }
 }
 impl Time for Stm<'_> {
-    // Frequency derivation is in the `Freq520KHz` struct docstring above.
-    type Frequency = Freq520KHz;
+    // Frequency derivation is in the `Freq516KHz` documentation above.
+    type Frequency = Freq516KHz;
     type Ticks = Ticks32;
     fn now(&self) -> Self::Ticks {
         Self::Ticks::from(self.registers.cnt.get())
@@ -251,8 +265,10 @@ impl Time for Stm<'_> {
 }
 impl<'a> Counter<'a> for Stm<'a> {
     fn start(&self) -> Result<(), kernel::ErrorCode> {
-        // Prescaler value 0xFF selects /256 (RM §41.3.2 field `15-8 CPS`).
-        self.registers.cr.modify(CR::CPS.val(255) + CR::TEN::SET);
+        // RM §41.3.2 defines the timer divider as CPS + 1.
+        self.registers
+            .cr
+            .modify(CR::CPS.val(u32::from(STM_CPS)) + CR::TEN::SET);
         Ok(())
     }
     fn stop(&self) -> Result<(), kernel::ErrorCode> {
@@ -304,5 +320,20 @@ impl<'a> Alarm<'a> for Stm<'a> {
     }
     fn is_armed(&self) -> bool {
         self.registers.ccr0.is_set(CCR::CEN)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel::hil::time::Frequency;
+
+    #[test]
+    fn stm_frequency_derives_from_source_and_cps() {
+        assert_eq!(STM_CPS, 255);
+        assert_eq!(STM_PRESCALER, u32::from(STM_CPS) + 1);
+        assert_eq!(STM_FREQUENCY_HZ, STM_SOURCE_HZ / STM_PRESCALER);
+        assert_eq!(Freq516KHz::frequency(), STM_FREQUENCY_HZ);
+        assert_eq!(STM_FREQUENCY_HZ, 516_419);
     }
 }

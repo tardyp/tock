@@ -29,11 +29,8 @@ use cortexm7::{CortexM7, CortexMVariant};
 //
 // With .multiboot empty, the Tock linker places BASE_VECTORS at byte 0 of
 // the image (= ram_start), satisfying the boot ROM contract.
-// The reset handler is self-sufficient: it masks IRQs (so no exception frame
-// is pushed onto the un-initialized ECC DTCM stack window), enables the FPU
-// for the hard-float target, zeroes the DTCM stack window with word stores,
-// sets MSP, re-enables IRQs (the cpsid window is closed once the stack is
-// inherited: DTCM EN=1 at cold reset
+// The reset handler masks IRQs while it enables the FPU, zeros the L2 SRAM
+// stack window, sets MSP, and restores PRIMASK before Tock RAM initialization.
 #[cfg(all(target_arch = "arm", target_os = "none"))]
 core::arch::global_asm!(
     r#"
@@ -46,11 +43,9 @@ core::arch::global_asm!(
     .type nxp_s32g3_boot_entry, %function
     .thumb_func
 nxp_s32g3_boot_entry:
-    /* 0. Mask IRQs and clear scratch regs.  cpsid i is critical: MSP was loaded by
-     *    points at the *top* of the uninitialized ECC DTCM stack window.
-     *    Any exception entry before that window is zeroed would push the
-     *    8-word frame into uninitialized DTCM and raise an imprecise
-     *    BusFault, which escalates to HardFault. */
+    /* 0. Mask IRQs and clear scratch regs. `cpsid i` protects the uninitialized
+     *    ECC L2 SRAM stack window: an exception frame pushed before zeroing
+     *    `_sstack .. _estack` could raise an imprecise BusFault. */
     cpsid i
     movs r0, #0
     movs r1, #0
@@ -61,10 +56,10 @@ nxp_s32g3_boot_entry:
     movs r6, #0
     movs r7, #0
 
-    /* 2. Enable FPU: CP10 + CP11 full access in CPACR (0xE000ED88).
+    /* 1. Enable FPU: CP10 + CP11 full access in CPACR (0xE000ED88).
      *    bits[23:20] = 0b1111 => mask 0x00F00000.
      *    Target is thumbv7em-none-eabihf (hard-float); this prevents a silent
-     *    NOCP UsageFault on the first VFP instruction on the NOR path. */
+     *    NOCP UsageFault on the first VFP instruction. */
     movw r0, #0xED88
     movt r0, #0xE000
     ldr  r1, [r0]
@@ -75,7 +70,7 @@ nxp_s32g3_boot_entry:
     dsb  sy
     isb
 
-    /* 3. Zero the ECC-protected DTCM stack window (_sstack .. _estack)
+    /* 3. Zero the ECC-protected L2 SRAM stack window (_sstack .. _estack)
      *    with word stores before moving MSP into it. */
     movw r0, #:lower16:_sstack
     movt r0, #:upper16:_sstack
@@ -92,16 +87,10 @@ nxp_s32g3_boot_entry:
      *    BASE_VECTORS[0]; this write is a safety no-op that matches the
      *    production reset handler pattern. */
     mov  sp, r1
-    /* 6. Re-enable IRQs.  The cpsid i above only had to cover the window where
-     *    MSP pointed at the un-zeroed ECC DTCM stack (an exception frame push
-     *    would have BusFaulted).  That window is closed: the stack is zeroed
-     *    (step 3) and MSP is set (step 4).  Unmask here so PRIMASK is clear
-     *    before Rust main() / kernel_loop runs (the upstream Cortex-M
-     *    invariant); otherwise the first kernel->user `svc` escalates to a
-     *    forced HardFault.  NVIC sources stay individually masked until the
-     *    kernel's init() enables them. */
+    /* 5. Re-enable IRQs after zeroing the L2 SRAM stack (step 3) and setting
+     *    MSP (step 4). PRIMASK must be clear before Rust main()/kernel_loop. */
     cpsie i
-    /* 7. Hand off to Tock's RAM init (zeroes .bss, copies .data, calls main). */
+    /* 6. Hand off to Tock's RAM init (zeroes .bss, copies .data, calls main). */
     b    initialize_ram_jump_to_main
     .size nxp_s32g3_boot_entry, . - nxp_s32g3_boot_entry
 "#,

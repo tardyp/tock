@@ -4,7 +4,7 @@
 
 use core::fmt::Write;
 use kernel::utilities::io_write::IoWrite;
-use nxp_s32g3::linflexd::LinFlexD;
+use nxp_s32g3::linflexd::transmit_lf0_sync;
 
 /// Writer is used by kernel::debug to panic message to the serial port.
 pub struct Writer {}
@@ -14,19 +14,17 @@ pub static mut WRITER: Writer = Writer {};
 
 impl Write for Writer {
     fn write_str(&mut self, s: &str) -> ::core::fmt::Result {
-        self.write(s.as_bytes());
+        transmit_lf0_sync(s.as_bytes());
         Ok(())
     }
 }
 
 impl IoWrite for Writer {
     fn write(&mut self, buf: &[u8]) -> usize {
-        let uart = LinFlexD::new_lf0(); // Console is on lf0; sync TX is safe while panicking.
-        uart.transmit_sync(buf);
-        buf.len()
+        transmit_lf0_sync(buf)
     }
 }
-
+#[cfg(not(test))]
 #[panic_handler]
 unsafe fn panic_handler(panic_info: &core::panic::PanicInfo) -> ! {
     use core::ptr::addr_of_mut;

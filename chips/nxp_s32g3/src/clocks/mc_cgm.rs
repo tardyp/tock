@@ -156,8 +156,8 @@ register_bitfields![u32,
 
 /// Clock source index values for MC_CGM mux selectors.
 ///
-/// These are the selector indices written to MUX_CSC[SELCTL] and read from
-/// MUX_CSS[SELSTAT]. Only sources relevant to the main application clocks are
+/// These are the selector indices written to `MUX_CSC[SELCTL]` and read from
+/// `MUX_CSS[SELSTAT]`. Only sources relevant to the main application clocks are
 /// enumerated. See RM Table 78 for the complete mapping.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 #[repr(u8)]
@@ -391,7 +391,7 @@ impl McCgm {
             return None;
         }
         let regs = &*self.registers;
-        let raw = regs.mux[mux].css.read(MUX_CSS::SELSTAT) as u8;
+        let raw = u8::try_from(regs.mux[mux].css.read(MUX_CSS::SELSTAT)).ok()?;
         CgmClockSource::from_u8(raw)
     }
 
@@ -417,20 +417,18 @@ impl McCgm {
         div_value: u16,
     ) -> Result<(), ErrorCode> {
         let _name = self.instance.name();
-        if mux >= self.instance.num_muxes() || div_index >= MAX_DIV_PER_MUX {
+        if mux >= self.instance.num_muxes() || div_index >= MAX_DIV_PER_MUX || div_value > 0x03FF {
             return Err(ErrorCode::INVAL);
         }
 
         let regs = &*self.registers;
         let mux_regs = &regs.mux[mux];
-
         let dc_reg = if div_index == 0 {
             &mux_regs.dc0
         } else {
             &mux_regs.dc1
         };
-
-        dc_reg.write(MUX_DC::DE::SET + MUX_DC::DIV.val(div_value as u32));
+        dc_reg.write(MUX_DC::DE::SET + MUX_DC::DIV.val(u32::from(div_value)));
 
         for _ in 0..HW_POLL_MAX {
             if !mux_regs.div_upd_stat.is_set(MUX_DIV_UPD_STAT::DIV_UPD_STAT) {

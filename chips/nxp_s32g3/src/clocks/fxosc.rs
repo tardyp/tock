@@ -113,8 +113,10 @@ impl Fxosc {
     /// Set the crystal/input frequency in MHz.
     ///
     /// Must be called before `enable()`.
-    pub fn set_frequency_mhz(&self, freq_mhz: u32) {
-        self.frequency_hz.set(freq_mhz * 1_000_000);
+    pub fn set_frequency_mhz(&self, freq_mhz: u32) -> Result<(), ErrorCode> {
+        let frequency_hz = freq_mhz.checked_mul(1_000_000).ok_or(ErrorCode::INVAL)?;
+        self.frequency_hz.set(frequency_hz);
+        Ok(())
     }
 
     /// Get the FXOSC frequency in Hz, if enabled.
@@ -128,7 +130,8 @@ impl Fxosc {
 
     /// Get the FXOSC frequency in MHz, if enabled.
     pub fn get_frequency_mhz(&self) -> Option<usize> {
-        self.get_frequency_hz().map(|f| (f / 1_000_000) as usize)
+        self.get_frequency_hz()
+            .and_then(|frequency| usize::try_from(frequency / 1_000_000).ok())
     }
 
     /// Enable the FXOSC in the specified mode, following RM §28.5 init sequence.

@@ -24,7 +24,12 @@
 pub mod xrdc_0;
 pub mod xrdc_1;
 
+#[cfg(not(all(target_arch = "arm", target_os = "none")))]
 use core::sync::atomic::{compiler_fence, Ordering};
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+use cortexm::dma_fence::CortexMDmaFence;
+#[cfg(all(target_arch = "arm", target_os = "none"))]
+use kernel::platform::dma_fence::DmaFence;
 use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, register_structs, ReadOnly, ReadWrite};
 use kernel::utilities::StaticRef;
@@ -536,8 +541,8 @@ pub(crate) const fn acp_bits_hi(domain: Domain, access: Access) -> u32 {
     }
 }
 
-/// Marker trait gating the [`MdaEntry::force_secure`] / `force_privileged`
-/// override methods to bus-initiator master variants only (DFMT1).
+/// Marker trait gating bus-initiator-only secure and privileged override
+/// methods (DFMT1).
 ///
 /// The chip crate does not give core initiators (DFMT0) these methods because
 /// the corresponding `SA` / `PA` fields don't exist in that format. Attempts
@@ -679,8 +684,8 @@ impl MrgdRaw {
 }
 /// How to locate an MRGD descriptor to patch at runtime.
 ///
-/// Used by [`Xrdc0::search_and_patch_mrgd`] and [`Xrdc1::search_and_patch_mrgd`]
-/// when a prior boot stage may have already programmed the descriptor with
+/// Used by the XRDC_0 and XRDC_1 `search_and_patch_mrgd` methods when a prior
+/// boot stage may have already programmed the descriptor with
 /// run-time-determined bounds.
 #[derive(Debug)]
 pub enum MrgdTarget {
@@ -689,22 +694,22 @@ pub enum MrgdTarget {
     /// Match the first descriptor whose range contains `probe_addr`.
     ContainsAddress(u32),
 }
-#[derive(Debug, PartialEq, Eq)]
+/// Outcome of an XRDC additive patch.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum MrgdPatchOutcome {
-    /// An existing descriptor was found and its ACP bits were OR'd.
+    /// An existing descriptor was found and its ACP bits were replaced.
     PatchedExisting { slot: usize },
-    /// No matching descriptor; a new slot was allocated and programmed.
+    /// No static descriptor matched; a free slot was allocated.
     AllocatedNew { slot: usize },
 }
-#[derive(Debug, PartialEq, Eq)]
-pub enum MrgdPatchError {
-    /// The target MRC has no free descriptor slots.
-    MrcFull,
-    /// The matching descriptor is locked (`LK2` set); writes are RAZ/WI.
-    DescriptorLocked { slot: usize },
-    /// [`MrgdTarget::ContainsAddress`] found more than one descriptor covering
-    /// the probe address.
-    MultipleMatches { first: usize, second: usize },
+
+/// A policy patch could not safely be applied.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum XrdcPatchError {
+    LockedDescriptor,
+    NoFreeDescriptor,
+    MissingTarget,
+    AmbiguousTarget,
 }
 
 /// Chip-crate-internal representation of a [`xrdc_0::Pdac`] entry.
@@ -863,10 +868,18 @@ impl MdaRaw {
 // apply-time helpers shared between XRDC instances
 // =============================================================================
 
-/// Compiler barrier — mirrored from the old [`Xrdc::register_barrier`] so the
-/// apply sequence in [`xrdc_0`] can reuse it without depending on the
-/// deprecated struct.
+/// Publish prior XRDC MMIO writes before a VLD or GVLD write.
+///
+/// `CortexMDmaFence::release()` emits the architecture `dmb` instruction on
+/// Cortex-M targets. Host tests retain a compiler fence because the architecture
+/// implementation intentionally rejects execution on a non-Cortex-M host.
 pub(crate) fn register_barrier() {
+    #[cfg(all(target_arch = "arm", target_os = "none"))]
+    unsafe {
+        let mut empty: [u8; 0] = [];
+        CortexMDmaFence::new().release(&mut empty);
+    }
+    #[cfg(not(all(target_arch = "arm", target_os = "none")))]
     compiler_fence(Ordering::SeqCst);
 }
 
@@ -973,172 +986,87 @@ pub(crate) fn program_mda_core(slot: &XrdcMdaRegisters, raw: MdaRaw, lock: bool)
     }
     slot.word[0].set(w);
 }
-
 /// Program one MDA word for a bus initiator (DFMT1).
 pub(crate) fn program_mda_bus(slot: &XrdcMdaRegisters, raw: MdaRaw, lock: bool) {
-    program_mda_core(slot, raw, lock); // identical apply sequence; raw.word already encodes DFMT1
-}
-/// Additive patch of one PDAC entry. Reads existing W0/W1, replaces the ACP
-/// level field from `raw`, preserves SE/SNUM/LK2, and does the VLD cycling dance.
-/// Used by `Xrdc{N}::patch`; never invalidates unlisted slots.
-///
-/// ### Safety
-/// Replaces the ACP level rather than OR-ing bits, so over-grant is impossible.
-pub(crate) fn patch_pdac(pdac: &XrdcPdacRegisters, raw: PdacRaw) {
-    let w1 = pdac.w1.get();
-    // Clear VLD first (RM §15.7.3.17 W3-revalidation requirement).
-    pdac.w1.set(w1 & !(1u32 << 31));
-    register_barrier();
-    // Replace ACP grants; preserve SE/SNUM fields in W0 and LK2 in W1.
-    let w0 = pdac.w0.get();
-    let w0n = (w0 & !ACP_LO_MASK) | (raw.w0 & ACP_LO_MASK);
-    pdac.w0.set(w0n);
-    let w1n = (w1 & !ACP_HI_MASK) | (raw.w1_acp & ACP_HI_MASK) | (1u32 << 31);
-    pdac.w1.set(w1n);
-    register_barrier();
+    program_mda_core(slot, raw, lock);
 }
 
-/// Additive patch of one MDA word. Preserves fields the driver does not
-/// control (PIDM, PID, DIDS, PE for core; PIDM, PID, DIDS for bus) and
-/// replaces only the attributes encoded in `raw.word`.
-pub(crate) fn patch_mda(slot: &XrdcMdaRegisters, raw: MdaRaw) {
+/// Additively patch one PDAC entry, preserving hardware-owned fields.
+pub(crate) fn patch_pdac(pdac: &XrdcPdacRegisters, raw: PdacRaw) -> Result<(), XrdcPatchError> {
+    let w1 = pdac.w1.get();
+    if w1 & LK2_MASK != 0 {
+        return Err(XrdcPatchError::LockedDescriptor);
+    }
+    pdac.w1.set(w1 & !(1u32 << 31));
+    register_barrier();
+    let w0 = pdac.w0.get();
+    pdac.w0.set((w0 & !ACP_LO_MASK) | (raw.w0 & ACP_LO_MASK));
+    register_barrier();
+    pdac.w1
+        .set((w1 & !ACP_HI_MASK) | (raw.w1_acp & ACP_HI_MASK) | (1u32 << 31));
+    Ok(())
+}
+
+/// Additively patch one MDA word, preserving hardware-owned fields.
+pub(crate) fn patch_mda(slot: &XrdcMdaRegisters, raw: MdaRaw) -> Result<(), XrdcPatchError> {
     let current = slot.word[0].get();
+    if current & (1u32 << 30) != 0 {
+        return Err(XrdcPatchError::LockedDescriptor);
+    }
     let mask = if raw.is_bus {
-        // Bus (DFMT1): replace DFMT, DIDB, SA, PA, DID.
         (1u32 << MDA_DFMT_SHIFT)
             | (1u32 << MDA_DIDB_SHIFT)
             | (0b11u32 << MDA_SA_SHIFT)
             | (0b11u32 << MDA_PA_SHIFT)
             | (0xFu32 << MDA_DID_SHIFT)
     } else {
-        // Core (DFMT0): replace only DID.
         0xFu32 << MDA_DID_SHIFT
     };
-    let new = (current & !mask) | raw.word | (1u32 << 31); // VLD = Valid
-    slot.word[0].set(new);
+    let new = (current & !mask) | raw.word;
+    slot.word[0].set(new & !(1u32 << 31));
+    register_barrier();
+    slot.word[0].set(new | (1u32 << 31));
+    Ok(())
 }
-/// Additive patch of one MRGD descriptor. Searches the MRC window for an
-/// existing entry with matching address range; if found, replaces the ACP level.
-/// If not found, allocates in the first unused slot within the MRC.
-///
-/// ### Safety
-/// Replaces the ACP level rather than OR-ing bits, so over-grant is impossible.
-/// Skips locked descriptors (LK2 != 0) silently — writes would be RAZ/WI.
-pub(crate) fn patch_mrgd(mrgds: &[XrdcMemoryRegionDescriptorRegisters], raw: MrgdRaw) {
+/// Additively patch one static MRGD descriptor.
+pub(crate) fn patch_mrgd(
+    mrgds: &[XrdcMemoryRegionDescriptorRegisters],
+    raw: MrgdRaw,
+    nmrgd: usize,
+) -> Result<(), XrdcPatchError> {
     let mrc_base = raw.mrc as usize * 16;
-    let mrc_end = mrc_base + 16;
-    let mut first_unused: Option<usize> = None;
+    let mrc_end = mrc_base + nmrgd;
+    let mut first_unused = None;
+    let mut matched = None;
 
     for i in mrc_base..mrc_end {
         let mrgd = &mrgds[i];
         let w3 = mrgd.w3.get();
         if w3 & (1u32 << 31) != 0 {
-            let w0 = mrgd.w0.get();
-            let w1 = mrgd.w1.get();
-            if w0 == raw.srtaddr_field && w1 == raw.endaddr_field {
-                // Skip locked descriptors (LK2 != 0) — writes are RAZ/WI.
-                if w3 & LK2_MASK != 0 {
-                    return;
+            if mrgd.w0.get() == raw.srtaddr_field && mrgd.w1.get() == raw.endaddr_field {
+                if matched.replace(i).is_some() {
+                    return Err(XrdcPatchError::AmbiguousTarget);
                 }
-                // Matching region found — replace ACP level.
-                mrgd.w3.set(w3 & !(1u32 << 31)); // clear VLD
-                register_barrier();
-                let w2 = mrgd.w2.get();
-                mrgd.w2
-                    .set((w2 & !ACP_LO_MASK) | (raw.acp_lo & ACP_LO_MASK));
-                let new_w3 =
-                    (w3 & !(1u32 << 31) & !ACP_HI_MASK) | (raw.acp_hi & ACP_HI_MASK) | (1u32 << 31);
-                mrgd.w3.set(new_w3);
-                register_barrier();
-                return;
             }
         } else if first_unused.is_none() {
             first_unused = Some(i);
         }
     }
 
-    // No existing match — allocate in first unused slot.
-    if let Some(i) = first_unused {
-        let mrgd = &mrgds[i];
-        mrgd.w0.set(raw.srtaddr_field);
-        mrgd.w1.set(raw.endaddr_field);
-        mrgd.w2.set(raw.acp_lo);
-        register_barrier();
-        mrgd.w3.set(raw.acp_hi | (1u32 << 31));
-        register_barrier();
-    }
-}
-/// Runtime search-and-patch of one MRGD descriptor.
-///
-/// Searches the MRC window for an existing entry according to `target`:
-/// * [`MrgdTarget::ExactRange`] — match `SRTADDR`/`ENDADDR` exactly against
-///   `raw.srtaddr_field` / `raw.endaddr_field`.
-/// * [`MrgdTarget::ContainsAddress`] — decode each live descriptor's bounds and
-///   match the first one that contains `probe_addr`.
-///
-/// If a match is found, the ACP level is replaced and VLD is cycled. If no
-/// match, the first unused slot in the MRC is allocated with the full `raw`
-/// bounds + ACP.
-///
-/// Lock pre-check: if the matching descriptor has `LK2 != 0`, returns
-/// [`MrgdPatchError::DescriptorLocked`] rather than attempting a RAZ/WI write.
-/// This helper never sets lock bits — ownership stays with the prior boot stage.
-pub(crate) fn search_and_patch_mrgd(
-    mrgds: &[XrdcMemoryRegionDescriptorRegisters],
-    raw: MrgdRaw,
-    target: MrgdTarget,
-    nmrgd: usize,
-) -> Result<MrgdPatchOutcome, MrgdPatchError> {
-    let mrc_base = raw.mrc as usize * 16;
-    let mrc_end = mrc_base + nmrgd;
-    let mut first_unused: Option<usize> = None;
-    let mut match_idx: Option<usize> = None;
-    for i in mrc_base..mrc_end {
+    if let Some(i) = matched {
         let mrgd = &mrgds[i];
         let w3 = mrgd.w3.get();
-        let is_valid = w3 & (1u32 << 31) != 0;
-        if is_valid {
-            let w0 = mrgd.w0.get();
-            let w1 = mrgd.w1.get();
-            let matched = match target {
-                MrgdTarget::ExactRange => w0 == raw.srtaddr_field && w1 == raw.endaddr_field,
-                MrgdTarget::ContainsAddress(probe_addr) => {
-                    let srtaddr = (w0 & !1u32) << 4;
-                    let endaddr = ((w1 & !1u32) << 4) | 0x1F;
-                    probe_addr >= srtaddr && probe_addr <= endaddr
-                }
-            };
-            if matched {
-                if let Some(prev) = match_idx {
-                    return Err(MrgdPatchError::MultipleMatches {
-                        first: prev,
-                        second: i,
-                    });
-                }
-                match_idx = Some(i);
-            }
-        } else if first_unused.is_none() {
-            first_unused = Some(i);
-        }
-    }
-    if let Some(i) = match_idx {
-        let mrgd = &mrgds[i];
-        let w3 = mrgd.w3.get();
-        // LK2 is bits 30:29 (2-bit field starting at 29). Any non-zero value
-        // means locked (RAZ/WI until reset).
         if w3 & LK2_MASK != 0 {
-            return Err(MrgdPatchError::DescriptorLocked { slot: i });
+            return Err(XrdcPatchError::LockedDescriptor);
         }
-        mrgd.w3.set(w3 & !(1u32 << 31)); // clear VLD
+        mrgd.w3.set(w3 & !(1u32 << 31));
         register_barrier();
         let w2 = mrgd.w2.get();
         mrgd.w2
             .set((w2 & !ACP_LO_MASK) | (raw.acp_lo & ACP_LO_MASK));
-        let new_w3 =
-            (w3 & !(1u32 << 31) & !ACP_HI_MASK) | (raw.acp_hi & ACP_HI_MASK) | (1u32 << 31);
-        mrgd.w3.set(new_w3);
-        register_barrier();
-        Ok(MrgdPatchOutcome::PatchedExisting { slot: i })
+        mrgd.w3
+            .set((w3 & !(1u32 << 31) & !ACP_HI_MASK) | (raw.acp_hi & ACP_HI_MASK) | (1u32 << 31));
+        Ok(())
     } else if let Some(i) = first_unused {
         let mrgd = &mrgds[i];
         mrgd.w0.set(raw.srtaddr_field);
@@ -1146,11 +1074,123 @@ pub(crate) fn search_and_patch_mrgd(
         mrgd.w2.set(raw.acp_lo);
         register_barrier();
         mrgd.w3.set(raw.acp_hi | (1u32 << 31));
+        Ok(())
+    } else {
+        Err(XrdcPatchError::NoFreeDescriptor)
+    }
+}
+/// Search and patch one MRGD descriptor within its hardware NMRGD budget.
+///
+/// Exact static ranges may allocate a free descriptor. A runtime containment
+/// search must identify policy installed by an earlier boot stage, so a miss is
+/// reported rather than allocating a second overlapping descriptor.
+pub(crate) fn search_and_patch_mrgd(
+    mrgds: &[XrdcMemoryRegionDescriptorRegisters],
+    raw: MrgdRaw,
+    target: MrgdTarget,
+    nmrgd: usize,
+) -> Result<MrgdPatchOutcome, XrdcPatchError> {
+    let mrc_base = raw.mrc as usize * 16;
+    let mrc_end = mrc_base + nmrgd;
+    let mut first_unused = None;
+    let mut match_idx = None;
+
+    for i in mrc_base..mrc_end {
+        let mrgd = &mrgds[i];
+        let w3 = mrgd.w3.get();
+        if w3 & (1u32 << 31) != 0 {
+            let matched = match target {
+                MrgdTarget::ExactRange => {
+                    mrgd.w0.get() == raw.srtaddr_field && mrgd.w1.get() == raw.endaddr_field
+                }
+                MrgdTarget::ContainsAddress(probe_addr) => {
+                    let srtaddr = (mrgd.w0.get() & !1u32) << 4;
+                    let endaddr = ((mrgd.w1.get() & !1u32) << 4) | 0x1F;
+                    probe_addr >= srtaddr && probe_addr <= endaddr
+                }
+            };
+            if matched {
+                if match_idx.replace(i).is_some() {
+                    return Err(XrdcPatchError::AmbiguousTarget);
+                }
+            }
+        } else if first_unused.is_none() {
+            first_unused = Some(i);
+        }
+    }
+
+    if let Some(i) = match_idx {
+        let mrgd = &mrgds[i];
+        let w3 = mrgd.w3.get();
+        if w3 & LK2_MASK != 0 {
+            return Err(XrdcPatchError::LockedDescriptor);
+        }
+        mrgd.w3.set(w3 & !(1u32 << 31));
         register_barrier();
+        let w2 = mrgd.w2.get();
+        mrgd.w2
+            .set((w2 & !ACP_LO_MASK) | (raw.acp_lo & ACP_LO_MASK));
+        mrgd.w3
+            .set((w3 & !(1u32 << 31) & !ACP_HI_MASK) | (raw.acp_hi & ACP_HI_MASK) | (1u32 << 31));
+        Ok(MrgdPatchOutcome::PatchedExisting { slot: i })
+    } else if matches!(target, MrgdTarget::ContainsAddress(_)) {
+        Err(XrdcPatchError::MissingTarget)
+    } else if let Some(i) = first_unused {
+        let mrgd = &mrgds[i];
+        mrgd.w0.set(raw.srtaddr_field);
+        mrgd.w1.set(raw.endaddr_field);
+        mrgd.w2.set(raw.acp_lo);
+        register_barrier();
+        mrgd.w3.set(raw.acp_hi | (1u32 << 31));
         Ok(MrgdPatchOutcome::AllocatedNew { slot: i })
     } else {
-        Err(MrgdPatchError::MrcFull)
+        Err(XrdcPatchError::NoFreeDescriptor)
     }
+}
+
+/// Allocate a static MRGD only after proving no valid descriptor overlaps it.
+///
+/// This is for a cold boot that has no predecessor-owned descriptor. Unlike
+/// [`search_and_patch_mrgd`] containment matching, it never guesses around an
+/// unknown overlapping policy.
+pub(crate) fn allocate_unmapped_exact_mrgd(
+    mrgds: &[XrdcMemoryRegionDescriptorRegisters],
+    raw: MrgdRaw,
+    nmrgd: usize,
+) -> Result<MrgdPatchOutcome, XrdcPatchError> {
+    let mrc_base = raw.mrc as usize * 16;
+    let mrc_end = mrc_base + nmrgd;
+    let target_start = raw.srtaddr_field & !1;
+    let target_end = raw.endaddr_field & !1;
+    let mut first_unused = None;
+
+    for i in mrc_base..mrc_end {
+        let mrgd = &mrgds[i];
+        let w3 = mrgd.w3.get();
+        if w3 & (1u32 << 31) == 0 {
+            if first_unused.is_none() {
+                first_unused = Some(i);
+            }
+            continue;
+        }
+
+        let start = mrgd.w0.get() & !1;
+        let end = mrgd.w1.get() & !1;
+        if start <= target_end && target_start <= end {
+            return Err(XrdcPatchError::AmbiguousTarget);
+        }
+    }
+
+    let Some(i) = first_unused else {
+        return Err(XrdcPatchError::NoFreeDescriptor);
+    };
+    let mrgd = &mrgds[i];
+    mrgd.w0.set(raw.srtaddr_field);
+    mrgd.w1.set(raw.endaddr_field);
+    mrgd.w2.set(raw.acp_lo);
+    register_barrier();
+    mrgd.w3.set(raw.acp_hi | (1u32 << 31));
+    Ok(MrgdPatchOutcome::AllocatedNew { slot: i })
 }
 
 // =============================================================================
@@ -1689,8 +1729,7 @@ mod tests {
         .grant(Domain::EDma, Access::FullRw)
         .grant(Domain::Hse, Access::FullRw)
         .grant(Domain::A53, Access::FullRw);
-        let outcome =
-            search_and_patch_mrgd(mrgds, raw, MrgdTarget::ContainsAddress(0x2400_6008), 4).unwrap();
+        let outcome = search_and_patch_mrgd(mrgds, raw, MrgdTarget::ExactRange, 4).unwrap();
         assert_eq!(
             outcome,
             MrgdPatchOutcome::AllocatedNew { slot: 0 },
@@ -1723,8 +1762,7 @@ mod tests {
         )
         .grant(Domain::M7_0, Access::FullRw)
         .grant(Domain::A53, Access::FullRw);
-        let _outcome =
-            search_and_patch_mrgd(mrgds, raw, MrgdTarget::ContainsAddress(0x2400_6008), 4).unwrap();
+        let _outcome = search_and_patch_mrgd(mrgds, raw, MrgdTarget::ExactRange, 4).unwrap();
         let expected_w2 = (Access::FullRw as u32) << MRGD_W2::D1ACP.shift
             | (Access::FullRw as u32) << MRGD_W2::D7ACP.shift;
         assert_eq!(backing[0 * WORDS_PER_SLOT + 2], expected_w2);
@@ -1817,7 +1855,7 @@ mod tests {
 
         // Patch with SecureRwNsRead (0b101) for the same domain.
         let patch = PdacRaw::new(1).grant(Domain::M7_0, Access::SecureRwNsRead);
-        patch_pdac(regs, patch);
+        patch_pdac(regs, patch).unwrap();
 
         let expected_w0 = (Access::SecureRwNsRead as u32) << PDAC_W0::D1ACP.shift;
         assert_eq!(backing[0], expected_w0, "ACP must be replaced, not OR'd");
@@ -1865,7 +1903,7 @@ mod tests {
             }],
         )
         .grant(Domain::M7_0, Access::SecureRwNsRead);
-        patch_mrgd(mrgds, patch);
+        patch_mrgd(mrgds, patch, 16).unwrap();
 
         let expected_w2 = (Access::SecureRwNsRead as u32) << MRGD_W2::D1ACP.shift;
         assert_eq!(
@@ -1915,7 +1953,10 @@ mod tests {
             }],
         )
         .grant(Domain::M7_0, Access::FullRw);
-        patch_mrgd(mrgds, patch); // should return silently without changing anything
+        assert_eq!(
+            patch_mrgd(mrgds, patch, 16),
+            Err(XrdcPatchError::LockedDescriptor)
+        );
 
         let expected_w2 = (Access::SupervisorRw as u32) << MRGD_W2::D1ACP.shift;
         assert_eq!(
@@ -1923,5 +1964,226 @@ mod tests {
             expected_w2,
             "locked descriptor must not be modified"
         );
+    }
+    #[test]
+    fn search_and_patch_mrgd_reports_missing_contains_target_without_allocating() {
+        const WORDS_PER_SLOT: usize = 8;
+        const RANGES: &[MrcRange] = &[MrcRange {
+            idx: 0,
+            start: 0x3000_0000,
+            end: 0x3FFF_FFFF,
+            nmrgd: 4,
+        }];
+        let mut backing = [0u32; WORDS_PER_SLOT * 16];
+        let mrgds: &[XrdcMemoryRegionDescriptorRegisters] =
+            unsafe { core::slice::from_raw_parts(backing.as_mut_ptr() as *const _, 16) };
+        let existing = MrgdRaw::region(0x3100_0000, 0x3100_001F, RANGES)
+            .grant(Domain::M7_0, Access::SupervisorRw);
+        program_mrgd(&mrgds[0], existing, false);
+        let raw =
+            MrgdRaw::region(0x3200_0000, 0x3200_001F, RANGES).grant(Domain::M7_0, Access::FullRw);
+
+        assert_eq!(
+            search_and_patch_mrgd(mrgds, raw, MrgdTarget::ContainsAddress(0x3200_0000), 4),
+            Err(XrdcPatchError::MissingTarget)
+        );
+        assert_eq!(
+            backing[0..4],
+            [
+                existing.srtaddr_field,
+                existing.endaddr_field,
+                existing.acp_lo,
+                1 << 31
+            ]
+        );
+        assert_eq!(
+            backing[8..32],
+            [0; 24],
+            "ContainsAddress misses must not allocate"
+        );
+    }
+
+    #[test]
+    fn patch_mrgd_reports_ambiguous_target_without_writing_either_match() {
+        const WORDS_PER_SLOT: usize = 8;
+        const RANGES: &[MrcRange] = &[MrcRange {
+            idx: 0,
+            start: 0x3000_0000,
+            end: 0x3FFF_FFFF,
+            nmrgd: 4,
+        }];
+        let mut backing = [0u32; WORDS_PER_SLOT * 16];
+        let mrgds: &[XrdcMemoryRegionDescriptorRegisters] =
+            unsafe { core::slice::from_raw_parts(backing.as_mut_ptr() as *const _, 16) };
+        let raw =
+            MrgdRaw::region(0x3420_0000, 0x3420_001F, RANGES).grant(Domain::M7_0, Access::FullRw);
+        program_mrgd(&mrgds[0], raw, false);
+        program_mrgd(&mrgds[1], raw, false);
+        let before = backing;
+
+        assert_eq!(
+            patch_mrgd(mrgds, raw, 4),
+            Err(XrdcPatchError::AmbiguousTarget)
+        );
+        assert_eq!(
+            backing, before,
+            "ambiguous static targets must not be modified"
+        );
+    }
+
+    #[test]
+    fn patch_mrgd_reports_no_free_descriptor_within_nmrgd_budget() {
+        const WORDS_PER_SLOT: usize = 8;
+        const RANGES: &[MrcRange] = &[MrcRange {
+            idx: 0,
+            start: 0x3000_0000,
+            end: 0x3FFF_FFFF,
+            nmrgd: 4,
+        }];
+        let mut backing = [0u32; WORDS_PER_SLOT * 16];
+        let mrgds: &[XrdcMemoryRegionDescriptorRegisters] =
+            unsafe { core::slice::from_raw_parts(backing.as_mut_ptr() as *const _, 16) };
+        for slot in 0..4 {
+            let offset = slot as u32 * 0x20;
+            let existing = MrgdRaw::region(0x3100_0000 + offset, 0x3100_001F + offset, RANGES);
+            program_mrgd(&mrgds[slot], existing, false);
+        }
+        let before = backing;
+        let raw = MrgdRaw::region(0x3200_0000, 0x3200_001F, RANGES);
+
+        assert_eq!(
+            patch_mrgd(mrgds, raw, 4),
+            Err(XrdcPatchError::NoFreeDescriptor)
+        );
+        assert_eq!(
+            backing, before,
+            "only slots within nmrgd may be searched or changed"
+        );
+    }
+
+    #[test]
+    fn search_and_patch_mrgd_exact_range_allocates_first_free_slot() {
+        const WORDS_PER_SLOT: usize = 8;
+        const RANGES: &[MrcRange] = &[MrcRange {
+            idx: 0,
+            start: 0x3000_0000,
+            end: 0x3FFF_FFFF,
+            nmrgd: 4,
+        }];
+        let mut backing = [0u32; WORDS_PER_SLOT * 16];
+        let mrgds: &[XrdcMemoryRegionDescriptorRegisters] =
+            unsafe { core::slice::from_raw_parts(backing.as_mut_ptr() as *const _, 16) };
+        program_mrgd(
+            &mrgds[0],
+            MrgdRaw::region(0x3100_0000, 0x3100_001F, RANGES),
+            false,
+        );
+        let raw =
+            MrgdRaw::region(0x3200_0000, 0x3200_001F, RANGES).grant(Domain::A53, Access::FullRw);
+
+        assert_eq!(
+            search_and_patch_mrgd(mrgds, raw, MrgdTarget::ExactRange, 4),
+            Ok(MrgdPatchOutcome::AllocatedNew { slot: 1 })
+        );
+        assert_eq!(
+            backing[8..12],
+            [
+                raw.srtaddr_field,
+                raw.endaddr_field,
+                raw.acp_lo,
+                raw.acp_hi | (1 << 31)
+            ]
+        );
+    }
+    #[test]
+    fn allocate_unmapped_exact_mrgd_allocates_empty_first_slot_with_exact_words() {
+        const WORDS_PER_SLOT: usize = 8;
+        const RANGES: &[MrcRange] = &[MrcRange {
+            idx: 0,
+            start: 0x3000_0000,
+            end: 0x3FFF_FFFF,
+            nmrgd: 4,
+        }];
+        let mut backing = [0u32; WORDS_PER_SLOT * 16];
+        let mrgds: &[XrdcMemoryRegionDescriptorRegisters] =
+            unsafe { core::slice::from_raw_parts(backing.as_mut_ptr() as *const _, 16) };
+        let raw = MrgdRaw::region(0x3200_0000, 0x3200_001F, RANGES)
+            .grant(Domain::M7_0, Access::FullRw)
+            .grant(Domain::A53, Access::SecureRwNsRead);
+
+        assert_eq!(
+            allocate_unmapped_exact_mrgd(mrgds, raw, 4),
+            Ok(MrgdPatchOutcome::AllocatedNew { slot: 0 })
+        );
+        assert_eq!(
+            backing[0..4],
+            [
+                raw.srtaddr_field,
+                raw.endaddr_field,
+                raw.acp_lo,
+                raw.acp_hi | (1 << 31)
+            ],
+            "empty allocation must write the requested MRGD words verbatim"
+        );
+        assert_eq!(backing[4..], [0; WORDS_PER_SLOT * 16 - 4]);
+    }
+
+    #[test]
+    fn allocate_unmapped_exact_mrgd_rejects_partial_overlap_without_mutation() {
+        const WORDS_PER_SLOT: usize = 8;
+        const RANGES: &[MrcRange] = &[MrcRange {
+            idx: 0,
+            start: 0x3000_0000,
+            end: 0x3FFF_FFFF,
+            nmrgd: 4,
+        }];
+        let mut backing = [0u32; WORDS_PER_SLOT * 16];
+        let mrgds: &[XrdcMemoryRegionDescriptorRegisters] =
+            unsafe { core::slice::from_raw_parts(backing.as_mut_ptr() as *const _, 16) };
+        let existing = MrgdRaw::region(0x3200_0000, 0x3200_003F, RANGES)
+            .grant(Domain::Hse, Access::SupervisorRw);
+        program_mrgd(&mrgds[0], existing, false);
+        let before = backing;
+        let raw =
+            MrgdRaw::region(0x3200_0020, 0x3200_005F, RANGES).grant(Domain::M7_0, Access::FullRw);
+
+        assert_eq!(
+            allocate_unmapped_exact_mrgd(mrgds, raw, 4),
+            Err(XrdcPatchError::AmbiguousTarget)
+        );
+        assert_eq!(
+            backing, before,
+            "an overlapping descriptor must not be changed or bypassed"
+        );
+    }
+
+    #[test]
+    fn allocate_unmapped_exact_mrgd_reports_no_free_descriptor_without_mutation() {
+        const WORDS_PER_SLOT: usize = 8;
+        const RANGES: &[MrcRange] = &[MrcRange {
+            idx: 0,
+            start: 0x3000_0000,
+            end: 0x3FFF_FFFF,
+            nmrgd: 4,
+        }];
+        let mut backing = [0u32; WORDS_PER_SLOT * 16];
+        let mrgds: &[XrdcMemoryRegionDescriptorRegisters] =
+            unsafe { core::slice::from_raw_parts(backing.as_mut_ptr() as *const _, 16) };
+        for slot in 0..4 {
+            let offset = slot as u32 * 0x20;
+            program_mrgd(
+                &mrgds[slot],
+                MrgdRaw::region(0x3100_0000 + offset, 0x3100_001F + offset, RANGES),
+                false,
+            );
+        }
+        let before = backing;
+        let raw = MrgdRaw::region(0x3200_0000, 0x3200_001F, RANGES);
+
+        assert_eq!(
+            allocate_unmapped_exact_mrgd(mrgds, raw, 4),
+            Err(XrdcPatchError::NoFreeDescriptor)
+        );
+        assert_eq!(backing, before, "a full NMRGD budget must remain unchanged");
     }
 }

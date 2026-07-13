@@ -7,10 +7,9 @@
  * Single link base: 0x34200000.  This address is within the M7_0 SRAM region
  * that is accessible after reset.
  *
- * Writable data could live in DTCM (zero-wait, ECC-protected) so the kernel
- * never depends on L2 SRAM staging beyond the initial code/rodata.
- * but this area is too small, and the tock default linker script has no option to separate kernel data into a different section.
- * So we place the kernel data in L2 SRAM, which is larger but slower.
+ * DTCM is deliberately unused: its 56 KiB capacity cannot hold the kernel's
+ * writable image, and splitting those sections would unnecessarily specialize
+ * Tock's default linker layout. L2 SRAM holds the stack, BSS, and data.
  */
 
 MEMORY

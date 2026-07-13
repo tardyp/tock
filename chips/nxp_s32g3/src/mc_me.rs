@@ -19,7 +19,6 @@
 use kernel::utilities::registers::interfaces::{ReadWriteable, Readable, Writeable};
 use kernel::utilities::registers::{register_bitfields, register_structs, ReadWrite};
 use kernel::utilities::StaticRef;
-use kernel::ErrorCode;
 
 // Memory map from RM §33.4.1 (MC_ME) and RM §29.13.1 (RDC). The MC_ME
 // partition registers repeat every 0x200 bytes; four partitions are exposed
@@ -318,6 +317,19 @@ pub const MC_RGM_BASE: StaticRef<McRgmRegisters> =
 pub const RDC_BASE: StaticRef<RdcRegisters> =
     unsafe { StaticRef::new(0x4008_0000 as *const RdcRegisters) };
 
+/// Failure returned while bringing an MC_ME partition out of reset.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum PartitionEnableError {
+    /// The requested partition does not exist in the S32G3 register block.
+    InvalidPartition,
+    /// The partition-clock state did not reach its requested value in time.
+    ClockTimeout,
+    /// The RDC interconnect did not become active in time.
+    InterconnectTimeout,
+    /// Output safe-state or peripheral-reset release did not complete in time.
+    ResetTimeout,
+}
+
 /// Bring a software-resettable partition out of reset and turn its
 /// peripheral clocks on.
 ///
@@ -357,36 +369,36 @@ pub const RDC_BASE: StaticRef<RdcRegisters> =
 /// Runtime reconfiguration is prohibited.
 ///
 /// # Errors
-/// Returns [`ErrorCode::FAIL`] if any hardware time-out expires.
-pub fn partition_enable(part: usize) -> Result<(), ErrorCode> {
-    let mc_me = MC_ME_BASE;
-    let mc_rgm = MC_RGM_BASE;
-    let rdc = RDC_BASE;
+/// Returns a distinct [`PartitionEnableError`] for invalid input or each
+/// hardware transition that exhausts its established polling budget.
+pub fn partition_enable(part: usize) -> Result<(), PartitionEnableError> {
+    partition_enable_with(part, MC_ME_BASE, MC_RGM_BASE, RDC_BASE)
+}
+
+fn partition_enable_with(
+    part: usize,
+    mc_me: StaticRef<McMeRegisters>,
+    mc_rgm: StaticRef<McRgmRegisters>,
+    rdc: StaticRef<RdcRegisters>,
+) -> Result<(), PartitionEnableError> {
+    if part >= mc_me.partitions.len() {
+        return Err(PartitionEnableError::InvalidPartition);
+    }
 
     // 1. Enable partition clock if not already enabled (RM §33.4.7 PCE, §33.4.8 PCUD).
     if !mc_me.partitions[part].stat.is_set(STAT::PCS) {
         mc_me.partitions[part].pconf.modify(PCONF::PCE::SET);
         mc_me.partitions[part].pupd.modify(PUPD::PCUD::SET);
-        mc_me_trigger();
-        mc_me_wait(part, false)?;
+        mc_me_trigger(mc_me);
+        mc_me_wait(mc_me, part, false).map_err(|()| PartitionEnableError::ClockTimeout)?;
     }
 
-    // 2. Enable RDC interconnect unconditionally (RM §29.13.2 UNLOCK / INTERCONNECT_DIS)
-    // so that system masters can reach targets in this partition regardless of
-    // reset state.
-    if !rdc.rd_status[part].is_set(RDC_STATUS::INTERCONNECT_STAT) {
+    // 2. A set RDC status means the interconnect is disabled and requires recovery.
+    if rdc.rd_status[part].is_set(RDC_STATUS::INTERCONNECT_STAT) {
         rdc.rd_ctrl[part].modify(RDC_CTRL::UNLOCK::SET);
         rdc.rd_ctrl[part].modify(RDC_CTRL::INTERCONNECT_DIS::CLEAR);
-        // RM §29.13.5: INTERCONNECT_STAT clears when the interconnect is fully re-enabled.
-        const RDC_POLL_MAX: usize = 1_000_000;
-        for _ in 0..RDC_POLL_MAX {
-            if !rdc.rd_status[part].is_set(RDC_STATUS::INTERCONNECT_STAT) {
-                break;
-            }
-        }
-        // If the bit is still set after the poll budget, the interconnect is stuck.
-        if rdc.rd_status[part].is_set(RDC_STATUS::INTERCONNECT_STAT) {
-            return Err(ErrorCode::FAIL);
+        if !rdc_becomes_active(|| !rdc.rd_status[part].is_set(RDC_STATUS::INTERCONNECT_STAT)) {
+            return Err(PartitionEnableError::InterconnectTimeout);
         }
         rdc.rd_ctrl[part].modify(RDC_CTRL::UNLOCK::CLEAR);
     }
@@ -394,28 +406,38 @@ pub fn partition_enable(part: usize) -> Result<(), ErrorCode> {
     // 3. Deassert peripheral reset unconditionally (RM §30.7.10 PERIPH_RST).
     mc_rgm.prst[part].rst.modify(RGM_PRST::PERIPH_RST::CLEAR);
 
-    // 4. Clear output-safe-state unconditionally (RM §33.4.32 OSSE, §33.4.33 OSSUD)
-    // so that the partition's bus bridges are taken out of isolation.
+    // 4. Clear output-safe-state (RM §33.4.32 OSSE, §33.4.33 OSSUD).
     mc_me.partitions[part].pconf.modify(PCONF::OSSE::CLEAR);
     mc_me.partitions[part].pupd.modify(PUPD::OSSUD::SET);
-    mc_me_trigger();
-    mc_me_wait(part, true)?;
+    mc_me_trigger(mc_me);
+    mc_me_wait(mc_me, part, true).map_err(|()| PartitionEnableError::ResetTimeout)?;
+
     // 5. Wait for peripheral reset deassertion to propagate (RM §30.7.10).
-    // The MC_RGM peripheral reset is asynchronous to the MC_ME state machine,
-    // so we poll PERIPH_RST_STAT after mc_me_wait has returned.
     const MAX_RST_POLL: usize = 1_000_000;
     for _ in 0..MAX_RST_POLL {
         if !mc_rgm.pstat[part].stat.is_set(RGM_PSTAT::PERIPH_RST_STAT) {
             return Ok(());
         }
     }
-    Err(ErrorCode::FAIL)
+    Err(PartitionEnableError::ResetTimeout)
 }
-/// Issue the CTL_KEY magic sequence that triggers the MC_ME state machine
-/// (RM §33.4.2: key `0x5AF0` followed by inverted key `0xA50F`).
-fn mc_me_trigger() {
-    MC_ME_BASE.ctl_key.write(CTL_KEY::KEY::TRIGGER_1);
-    MC_ME_BASE.ctl_key.write(CTL_KEY::KEY::TRIGGER_2);
+
+/// Polls the RDC status using its established 1,000,000-iteration budget.
+/// Kept separate so host tests can prove both an immediate transition and a
+/// permanently disabled interconnect without racing MMIO-backed memory.
+fn rdc_becomes_active(mut is_active: impl FnMut() -> bool) -> bool {
+    const RDC_POLL_MAX: usize = 1_000_000;
+    for _ in 0..RDC_POLL_MAX {
+        if is_active() {
+            return true;
+        }
+    }
+    false
+}
+/// Issue the CTL_KEY sequence that triggers MC_ME (RM §33.4.2).
+fn mc_me_trigger(mc_me: StaticRef<McMeRegisters>) {
+    mc_me.ctl_key.write(CTL_KEY::KEY::TRIGGER_1);
+    mc_me.ctl_key.write(CTL_KEY::KEY::TRIGGER_2);
 }
 /// Poll the partition status register until the requested state has been
 /// reached. `is_osse` selects between waiting for the partition clock
@@ -427,15 +449,12 @@ fn mc_me_trigger() {
 /// **Must only be called during board initialisation, before `kernel_loop()`.**
 /// Runtime reconfiguration is prohibited.
 ///
-/// # Errors
-/// Returns [`ErrorCode::FAIL`] if the state transition does not complete
-/// within the poll budget.
-fn mc_me_wait(part: usize, is_osse: bool) -> Result<(), ErrorCode> {
+/// Returns an error when the requested MC_ME state does not complete.
+fn mc_me_wait(mc_me: StaticRef<McMeRegisters>, part: usize, is_osse: bool) -> Result<(), ()> {
     // Units: bare loop iterations (register read + compare + branch).
     // At 48 MHz FIRC (~10 cycles/MMIO read) this caps the wait at ≈20 ms,
     // well above the hardware's sub-microsecond transition time.
     const MAX_WAIT_CYCLES: usize = 1_000_000;
-    let mc_me = MC_ME_BASE;
     for _ in 0..MAX_WAIT_CYCLES {
         if is_osse {
             let want = mc_me.partitions[part].pconf.is_set(PCONF::OSSE);
@@ -449,5 +468,113 @@ fn mc_me_wait(part: usize, is_osse: bool) -> Result<(), ErrorCode> {
             }
         }
     }
-    Err(ErrorCode::FAIL)
+    Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_registers(
+        mc_me: &mut [u32; 0x900 / 4],
+        mc_rgm: &mut [u32; 0x160 / 4],
+        rdc: &mut [u32; 0x100 / 4],
+    ) -> (
+        StaticRef<McMeRegisters>,
+        StaticRef<McRgmRegisters>,
+        StaticRef<RdcRegisters>,
+    ) {
+        unsafe {
+            (
+                StaticRef::new(mc_me.as_mut_ptr() as *const McMeRegisters),
+                StaticRef::new(mc_rgm.as_mut_ptr() as *const McRgmRegisters),
+                StaticRef::new(rdc.as_mut_ptr() as *const RdcRegisters),
+            )
+        }
+    }
+
+    #[test]
+    fn invalid_partition_is_rejected_without_register_mutation() {
+        let mut mc_me = [0; 0x900 / 4];
+        let mut mc_rgm = [0; 0x160 / 4];
+        let mut rdc = [0; 0x100 / 4];
+        let registers = test_registers(&mut mc_me, &mut mc_rgm, &mut rdc);
+
+        assert_eq!(
+            partition_enable_with(4, registers.0, registers.1, registers.2),
+            Err(PartitionEnableError::InvalidPartition)
+        );
+        assert_eq!(mc_me, [0; 0x900 / 4]);
+        assert_eq!(mc_rgm, [0; 0x160 / 4]);
+        assert_eq!(rdc, [0; 0x100 / 4]);
+    }
+
+    #[test]
+    fn inactive_rdc_does_not_touch_rdc_control_and_partition_enables() {
+        let mut mc_me = [0; 0x900 / 4];
+        let mut mc_rgm = [0; 0x160 / 4];
+        let mut rdc = [0; 0x100 / 4];
+        // Partition 0 PCS is already active, and OSSE is already inactive.
+        mc_me[0x108 / 4] = 1;
+        let registers = test_registers(&mut mc_me, &mut mc_rgm, &mut rdc);
+
+        assert_eq!(
+            partition_enable_with(0, registers.0, registers.1, registers.2),
+            Ok(())
+        );
+        assert_eq!(rdc, [0; 0x100 / 4]);
+    }
+
+    #[test]
+    fn active_rdc_is_polled_until_it_clears() {
+        let mut reads = 0;
+        assert!(rdc_becomes_active(|| {
+            reads += 1;
+            reads == 2
+        }));
+        assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn active_rdc_that_never_clears_returns_interconnect_timeout() {
+        let mut mc_me = [0; 0x900 / 4];
+        let mut mc_rgm = [0; 0x160 / 4];
+        let mut rdc = [0; 0x100 / 4];
+        mc_me[0x108 / 4] = 1;
+        rdc[0x080 / 4] = 1 << 4;
+        let registers = test_registers(&mut mc_me, &mut mc_rgm, &mut rdc);
+
+        assert_eq!(
+            partition_enable_with(0, registers.0, registers.1, registers.2),
+            Err(PartitionEnableError::InterconnectTimeout)
+        );
+    }
+
+    #[test]
+    fn stalled_clock_transition_returns_clock_timeout() {
+        let mut mc_me = [0; 0x900 / 4];
+        let mut mc_rgm = [0; 0x160 / 4];
+        let mut rdc = [0; 0x100 / 4];
+        let registers = test_registers(&mut mc_me, &mut mc_rgm, &mut rdc);
+
+        assert_eq!(
+            partition_enable_with(0, registers.0, registers.1, registers.2),
+            Err(PartitionEnableError::ClockTimeout)
+        );
+    }
+
+    #[test]
+    fn asserted_peripheral_reset_returns_reset_timeout() {
+        let mut mc_me = [0; 0x900 / 4];
+        let mut mc_rgm = [0; 0x160 / 4];
+        let mut rdc = [0; 0x100 / 4];
+        mc_me[0x108 / 4] = 1;
+        mc_rgm[0x140 / 4] = 1;
+        let registers = test_registers(&mut mc_me, &mut mc_rgm, &mut rdc);
+
+        assert_eq!(
+            partition_enable_with(0, registers.0, registers.1, registers.2),
+            Err(PartitionEnableError::ResetTimeout)
+        );
+    }
 }
